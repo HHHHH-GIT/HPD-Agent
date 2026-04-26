@@ -1,7 +1,7 @@
 from typing import TypedDict, Sequence
 
 from .enums import TaskDifficulty
-from .models import PlannerResult, SubTask, SubTaskOutput, TaskOutput
+from .models import AgentMeta, PlannerResult, SubTask, SubTaskOutput, TaskOutput
 from src.memory.context import ConversationContext
 
 
@@ -42,7 +42,10 @@ class AgentState(TypedDict):
 
     conversation_history: ConversationContext
     """Short-term rolling context window of the current conversation thread.
-    
+
     Tracks recent user/assistant message pairs so the agent can understand
     follow-up questions, pronouns, and conversational flow.
     """
+
+    agent_history: Sequence[AgentMeta]
+    """Record of which agents were invoked and on which sub-tasks."""

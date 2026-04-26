@@ -3,6 +3,25 @@ from pydantic import BaseModel, Field
 from .enums import TaskDifficulty, SubTaskDifficulty
 
 
+class AgentMeta(BaseModel):
+    """Metadata about an agent invocation — used to track multi-agent execution."""
+
+    role: str = Field(
+        description="Agent role: 'coordinator' or 'expert'."
+    )
+    agent_id: str = Field(
+        description="Unique identifier for this agent instance."
+    )
+    sub_task_id: int | None = Field(
+        default=None,
+        description="Sub-task ID this agent is responsible for. None for the coordinator.",
+    )
+    result_summary: str = Field(
+        default="",
+        description="Brief human-readable summary of what this agent did.",
+    )
+
+
 class TaskOutput(BaseModel):
     """Standardized output record for every node in the graph."""
 

@@ -4,6 +4,7 @@ from .context_cmd import run as run_context
 from .exit import run as run_exit
 from .help import run as run_help
 from .love import run as run_love
+from .model_cmd import run as run_model
 from .new_session import run as run_new
 from .sessions import run as run_sessions
 from .summary import run as run_summary
@@ -14,6 +15,7 @@ __all__ = [
     "run_exit",
     "run_help",
     "run_love",
+    "run_model",
     "run_new",
     "run_sessions",
     "run_summary",

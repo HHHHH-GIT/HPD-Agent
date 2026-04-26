@@ -37,6 +37,7 @@ async def run_all(
     Args:
         tasks:    Ordered DAG sub-tasks from the planner.
         executor: Async callable with signature ``(task_id, task_name, context)``.
+                  Pass None to use the ExpertAgent from src.agents.expert_agent.
         context:  Passed through to each executor call.
         retry:   Retry configuration (max_attempts, base_delay, max_delay).
 
@@ -48,6 +49,10 @@ async def run_all(
     Raises:
         RuntimeError: if a cycle / deadlock is detected.
     """
+    # Resolve executor: None means use ExpertAgent
+    if executor is None:
+        from src.agents.expert_agent import execute as expert_execute
+        executor = expert_execute
     statuses: dict[int, str] = {t.id: "pending" for t in tasks}
     done: list[SubTaskOutput] = []
     in_degree: dict[int, int] = {t.id: len(t.depends) for t in tasks}
@@ -132,6 +137,8 @@ async def _run_with_retry(
         try:
             result: SubTaskOutput = await executor(task.id, task.name, context)
             statuses[task.id] = "done"
+            if result.expert_mode:
+                print(f"[Scheduler]   子任务 {task.id} ({task.name}) → 专家模式")
             return result
         except Exception as exc:  # noqa: BLE001
             last_error = exc

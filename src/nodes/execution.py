@@ -1,4 +1,13 @@
-"""Sub-task executor: assesses difficulty then executes a single sub-task."""
+"""Execution node: difficulty assessment + LLM execution for a single sub-task.
+
+This is a pure business-logic node — no graph coupling, no state mutation.
+It handles:
+  - Sub-task difficulty assessment (easy / hard)
+  - LLM execution with prompt templating
+  - Summary extraction
+
+The expert agent calls this to make the "execute" decision.
+"""
 
 import re
 
@@ -30,36 +39,30 @@ def _extract_summary(detail: str) -> str:
     return candidates[-1] if candidates else detail[:80].strip()
 
 
-async def run(task_id: int, task_name: str, context: str) -> SubTaskOutput:
+async def execute(task_id: int, task_name: str, context: str) -> SubTaskOutput:
     """Assess difficulty and execute a single sub-task.
 
     Args:
-        task_id:  Sub-task ID from the DAG.
+        task_id:   Sub-task ID from the DAG.
         task_name: Human-readable sub-task name.
-        context:  The original user query (shared background context).
+        context:   The original user query (shared background context).
 
     Returns:
         SubTaskOutput with detail, summary, and expert_mode flag.
     """
-    # ── Difficulty assessment ─────────────────────────────────────────────────
+    # Step 1: Difficulty assessment
     classifier = get_structured_llm(SubTaskAssessmentResult)
     assessment: SubTaskAssessmentResult = await classifier.ainvoke(
         SUB_TASK_ASSESSMENT_PROMPT.format(task_id=task_id, task_name=task_name)
     )
-
     is_expert = assessment.difficulty == SubTaskDifficulty.HARD
-    if is_expert:
-        print(
-            f"\n[DEBUG] 子任务 {task_id} ({task_name}) 是困难子任务，后续调用专家模式"
-        )
 
-    # ── Execution ─────────────────────────────────────────────────────────────
+    # Step 2: Execution via LLM
     llm = get_llm()
     prompt = SUB_TASK_PROMPT.format(
         context=context, task_id=task_id, task_name=task_name
     )
     response = await llm.ainvoke(prompt)
-    
     content = getattr(response, "content", "") or str(response)
 
     return SubTaskOutput(

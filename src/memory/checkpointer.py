@@ -9,6 +9,7 @@ _MSGPACK_ALLOWLIST = [
     ("src.core.models", "SubTaskOutput"),
     ("src.core.models", "PlannerResult"),
     ("src.core.models", "TaskOutput"),
+    ("src.core.models", "AgentMeta"),
     ("src.memory.context", "Message"),
     ("src.memory.context", "MessageRole"),
     ("src.memory.context", "ConversationContext"),
