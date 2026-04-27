@@ -95,15 +95,18 @@ Based on the [HPD-Agent paper](./HPD-Agent.md).
 | 16                           | Fallback to cached best result on convergence failure    | Not yet         | Planned                                                                               |
 | **3+ Cross-cutting**         |                                                          |                 |                                                                                       |
 | 17                           | Full streaming output (all three paths)                  | **Implemented** | `direct_answer`, `executor`, `main.py`                                                |
-| 18                           | Multi-session management (create, list, switch)          | **Implemented** | `/new`, `/sessions`                                                                   |
-| 19                           | Context summarization                                    | **Implemented** | `/summary`                                                                            |
-| 20                           | Token-usage tracking (tiktoken)                          | **Implemented** | `/tokens`                                                                             |
-| 21                           | Multi-backend checkpointing (Memory / SQLite / Postgres) | **Implemented** | LangGraph Checkpointing                                                               |
-| 22                           | Model profile management (JSON, CLI)                     | **Implemented** | `/model` + `src/models/`                                                              |
-| 23                           | Multi-agent coordination (Coordinator + Expert agents)   | **Partial**     | Coordinator exists; Expert agents not yet separate                                    |
-| 24                           | Tool registry & tool-calling                             | Not yet         | Stub exists, not wired                                                                |
-| 25                           | Long-term memory (vector DB RAG)                         | Not yet         | Planned                                                                               |
-| 26                           | OpenTelemetry observability                              | Not yet         | Planned                                                                               |
+| 18                           | Per-project session isolation (SHA256 path hash)           | **Implemented** | `session_store.py` — `~/.hpagent/sessions/{hash}/`                                       |
+| 19                           | Multi-session management (create, list, switch)            | **Implemented** | `/new`, `/sessions`, `/sessions delete`                                                 |
+| 20                           | Project knowledge scan & HPD.MD generation                 | **Implemented** | `/skim`, `project_scanner.py`                                                          |
+| 21                           | HPD.MD auto-injection into boot prompt                    | **Implemented** | `system_info.py`, `build_boot_prompt()`                                                |
+| 22                           | Context summarization                                     | **Implemented** | `/summary`                                                                            |
+| 23                           | Token-usage tracking (tiktoken)                          | **Implemented** | `/tokens`                                                                             |
+| 24                           | Multi-backend checkpointing (Memory / SQLite / Postgres) | **Implemented** | LangGraph Checkpointing                                                               |
+| 25                           | Model profile management (JSON, CLI)                     | **Implemented** | `/model` + `src/models/`                                                              |
+| 26                           | Multi-agent coordination (Coordinator + Expert agents)   | **Partial**     | Coordinator exists; Expert agents not yet separate                                    |
+| 27                           | Tool registry & tool-calling                             | Not yet         | Stub exists, not wired                                                                |
+| 28                           | Long-term memory (vector DB RAG)                         | Not yet         | Planned                                                                               |
+| 29                           | OpenTelemetry observability                              | Not yet         | Planned                                                                               |
 
 
 ---
@@ -146,7 +149,8 @@ src/
 ├── memory/
 │   ├── __init__.py
 │   ├── checkpointer.py          # LangGraph checkpointer (Memory / SQLite / Postgres)
-│   └── context.py               # ConversationContext & message history
+│   ├── context.py               # ConversationContext & message history
+│   └── session_store.py         # per-project session persistence (~/.hpagent/sessions/{hash}/)
 ├── models/
 │   ├── __init__.py
 │   └── store.py                 # ModelProfile JSON store + singleton
@@ -161,7 +165,11 @@ src/
 │   └── synthesizer.py           # synthesis prompt builder
 ├── tools/
 │   ├── __init__.py
-│   └── registry.py              # tool registry & tool-calling
+│   ├── project_scanner.py      # project structure & tech-stack scanner
+│   ├── read_file.py            # read file contents
+│   ├── write_file.py           # write / edit file contents
+│   ├── terminal.py             # shell command execution
+│   └── registry.py             # tool registry & tool-calling
 └── workflow/
     ├── __init__.py
     └── builder.py               # LangGraph StateGraph assembly
@@ -179,8 +187,10 @@ src/
 | `/model <name>`          | Switch to a saved model                                                    |
 | `/context [-d] [-N]`     | View context window ( `-d`: full content, `*`: all, `-N`: last N messages) |
 | `/new`                   | Start a new conversation session                                           |
-| `/sessions [id]`         | List sessions or switch to one                                             |
+| `/sessions [id]`         | List sessions for the current project or switch to one                     |
+| `/sessions delete <id>`  | Delete a session for the current project                                   |
 | `/summary`               | Summarize context window and clear messages                                |
+| `/skim [path]`           | Scan the project and generate `HPD.MD` project knowledge summary           |
 | `/tokens`                | Show token usage of current context                                        |
 | `/exit`                  | Exit                                                                       |
 | `/help`                  | Show all commands                                                          |
@@ -190,7 +200,7 @@ src/
 
 ## Configuration
 
-**Model profiles** are stored in `~/.evo_agent/models.json` (created on first run).
+**Model profiles** are stored in `~/.hpagent/models.json` (created on first run; legacy `~/.evo_agent/models.json` is migrated automatically).
 
 The default profile uses:
 

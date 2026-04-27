@@ -9,7 +9,8 @@ from typing import Any
 
 import dacite
 
-DEFAULT_STORE_PATH = Path.home() / ".evo_agent" / "models.json"
+DEFAULT_STORE_PATH = Path.home() / ".hpagent" / "models.json"
+_OLD_STORE_PATH = Path.home() / ".evo_agent" / "models.json"
 
 
 @dataclass
@@ -48,6 +49,7 @@ class ModelStore:
 
     def _load(self) -> None:
         """Load profiles from JSON. Silently create the file if missing."""
+        self._migrate_legacy()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         if not self._path.exists():
             self._init_defaults()
@@ -70,6 +72,18 @@ class ModelStore:
 
         if self._active not in self._profiles:
             self._active = next(iter(self._profiles), "")
+
+    def _migrate_legacy(self) -> None:
+        """Copy models.json from the legacy ~/.evo_agent/ path if it exists."""
+        if self._path.exists():
+            return
+        if not _OLD_STORE_PATH.exists():
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            _OLD_STORE_PATH.rename(self._path)
+        except OSError:
+            pass
 
     def _save(self) -> None:
         """Write current profiles + active flag back to JSON."""

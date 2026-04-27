@@ -68,3 +68,4 @@ env/
 .codex/
 test_scheduler_context.py
 .analysis/
+HPD.MD

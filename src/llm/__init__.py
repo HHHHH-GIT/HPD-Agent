@@ -6,6 +6,7 @@ from .prompts import (
     SUB_TASK_PROMPT,
     SUB_TASK_ASSESSMENT_PROMPT,
     KEY_FINDINGS_PROMPT,
+    BOOT_PROMPT,
 )
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     "SUB_TASK_PROMPT",
     "SUB_TASK_ASSESSMENT_PROMPT",
     "KEY_FINDINGS_PROMPT",
+    "BOOT_PROMPT",
 ]

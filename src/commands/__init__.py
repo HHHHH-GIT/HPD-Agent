@@ -20,6 +20,7 @@ from src.commands.handlers import (
     run_model,
     run_new,
     run_sessions,
+    run_skim,
     run_summary,
     run_tokens,
 )
@@ -32,6 +33,7 @@ COMMAND_HANDLERS: dict[str, callable] = {
     "/model":      run_model,
     "/new":        run_new,
     "/sessions":   run_sessions,
+    "/skim":       run_skim,
     "/summary":    run_summary,
     "/tokens":     run_tokens,
 }

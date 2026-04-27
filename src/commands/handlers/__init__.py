@@ -7,6 +7,7 @@ from .love import run as run_love
 from .model_cmd import run as run_model
 from .new_session import run as run_new
 from .sessions import run as run_sessions
+from .skim import run as run_skim
 from .summary import run as run_summary
 from .tokens import run as run_tokens
 
@@ -18,6 +19,7 @@ __all__ = [
     "run_model",
     "run_new",
     "run_sessions",
+    "run_skim",
     "run_summary",
     "run_tokens",
 ]

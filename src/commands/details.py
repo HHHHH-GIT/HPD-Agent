@@ -5,7 +5,8 @@ COMMAND_DETAILS = {
     "/I!Love'You!": "Show some love",
     "/model":    "Manage models: /model [create | model-name]",
     "/new":      "Create a new session",
-    "/sessions": "List or switch sessions: /sessions [session-id]",
+    "/skim":    "Scan project and generate HPD.MD: /skim [path]",
+    "/sessions": "Manage sessions: /sessions [session-id | delete session-id]",
     "/summary":  "Summarize current session and reset context",
     "/tokens":   "Show context window token usage",
 }

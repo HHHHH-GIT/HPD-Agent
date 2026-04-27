@@ -8,6 +8,7 @@ from src.llm import get_llm
 from src.memory.context import ConversationContext, MessageRole
 from src.llm.prompts import SUMMARY_SYSTEM_PROMPT
 from src.llm.prompts import TOOLCHAIN_SUMMARY_PROMPT
+from src.system_info import build_boot_prompt
 
 
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -76,9 +77,16 @@ def run(raw: str, agent: QueryAgent) -> bool:
     ctx.messages.clear()
     ctx.sub_task_outputs.clear()
 
+    # Re-inject boot prompt so it survives the summary reset
+    from src.memory.context import Message
+    ctx.messages.insert(
+        0,
+        Message(role=MessageRole.ASSISTANT, content=build_boot_prompt()),
+    )
+
     full_content = summary_text
     if toolchain:
-        full_content = f"【工具调用链】\n{toolchain}\n\n{summary_text}"
+        full_content = f"【工具调用链】\n{toolchain}\n\n【对话摘要】\n {summary_text}"
 
     ctx.add_assistant_message(
         content=full_content,

@@ -92,15 +92,18 @@ answer     (DAG 规划)
 | 16 | 收敛失败时回退至缓存最优结果 | 未实现 | 计划中 |
 | **3+ 跨领域** | | | |
 | 17 | 全链路流式输出（全部三条路径） | **已实现** | `direct_answer`、`executor`、`main.py` |
-| 18 | 多会话管理（创建、列表、切换） | **已实现** | `/new`、`/sessions` |
-| 19 | 上下文摘要 | **已实现** | `/summary` |
-| 20 | Token 用量追踪（tiktoken） | **已实现** | `/tokens` |
-| 21 | 多后端检查点持久化（Memory / SQLite / Postgres） | **已实现** | LangGraph Checkpointing |
-| 22 | 模型配置管理（JSON + CLI） | **已实现** | `/model` + `src/models/` |
-| 23 | 多智能体协作（Coordinator + Expert agents） | **部分实现** | Coordinator 已存在；Expert agents 尚未独立拆分 |
-| 24 | 工具注册与工具调用 | 未实现 | 存根已预留，尚未接入 |
-| 25 | 长期记忆（向量数据库 RAG） | 未实现 | 计划中 |
-| 26 | OpenTelemetry 可观测性 | 未实现 | 计划中 |
+| 18 | 按项目隔离会话（SHA256 路径哈希） | **已实现** | `session_store.py` — `~/.hpagent/sessions/{hash}/` |
+| 19 | 多会话管理（创建、列表、切换） | **已实现** | `/new`、`/sessions`、`/sessions delete` |
+| 20 | 项目知识扫描与 HPD.MD 生成 | **已实现** | `/skim`、`project_scanner.py` |
+| 21 | HPD.MD 自动注入 boot prompt | **已实现** | `system_info.py`、`build_boot_prompt()` |
+| 22 | 上下文摘要 | **已实现** | `/summary` |
+| 23 | Token 用量追踪（tiktoken） | **已实现** | `/tokens` |
+| 24 | 多后端检查点持久化（Memory / SQLite / Postgres） | **已实现** | LangGraph Checkpointing |
+| 25 | 模型配置管理（JSON + CLI） | **已实现** | `/model` + `src/models/` |
+| 26 | 多智能体协作（Coordinator + Expert agents） | **部分实现** | Coordinator 已存在；Expert agents 尚未独立拆分 |
+| 27 | 工具注册与工具调用 | 未实现 | 存根已预留，尚未接入 |
+| 28 | 长期记忆（向量数据库 RAG） | 未实现 | 计划中 |
+| 29 | OpenTelemetry 可观测性 | 未实现 | 计划中 |
 
 ---
 
@@ -142,7 +145,8 @@ src/
 ├── memory/
 │   ├── __init__.py
 │   ├── checkpointer.py          # LangGraph 检查点（Memory / SQLite / Postgres）
-│   └── context.py               # ConversationContext 和消息历史
+│   ├── context.py               # ConversationContext 和消息历史
+│   └── session_store.py         # 按项目分目录的会话持久化（~/.hpagent/sessions/{hash}/）
 ├── models/
 │   ├── __init__.py
 │   └── store.py                 # ModelProfile JSON 存储 + 单例模式
@@ -157,7 +161,11 @@ src/
 │   └── synthesizer.py            # 综合 prompt 构建器
 ├── tools/
 │   ├── __init__.py
-│   └── registry.py              # 工具注册与工具调用
+│   ├── project_scanner.py      # 项目结构和技术栈扫描器
+│   ├── read_file.py            # 读取文件内容
+│   ├── write_file.py           # 写入/编辑文件内容
+│   ├── terminal.py             # Shell 命令执行
+│   └── registry.py             # 工具注册与工具调用
 └── workflow/
     ├── __init__.py
     └── builder.py               # LangGraph StateGraph 组装
@@ -174,8 +182,10 @@ src/
 | `/model <name>` | 切换到指定模型配置 |
 | `/context [-d] [-N \| *]` | 查看上下文窗口（`-d`：完整内容，`*`：全部，`-N`：最近 N 条消息） |
 | `/new` | 开始新会话 |
-| `/sessions [id]` | 列出所有会话或切换到指定会话 |
+| `/sessions [id]` | 列出当前项目的所有会话或切换到指定会话 |
+| `/sessions delete <id>` | 删除当前项目的指定会话 |
 | `/summary` | 对上下文窗口进行摘要并清空消息 |
+| `/skim [path]` | 扫描项目并生成 `HPD.MD` 项目知识摘要 |
 | `/tokens` | 显示当前上下文的 token 用量 |
 | `/exit` | 退出 |
 | `/help` | 显示所有命令 |
@@ -184,7 +194,7 @@ src/
 
 ## 配置
 
-**模型配置** 存储在 `~/.evo_agent/models.json`（首次运行自动创建）。
+**模型配置** 存储在 `~/.hpagent/models.json`（首次运行自动创建，旧版 `~/.evo_agent/models.json` 会被自动迁移）。
 
 默认配置使用：
 

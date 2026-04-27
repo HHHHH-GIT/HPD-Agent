@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import os
 import sys
@@ -150,7 +151,24 @@ async def run_loop():
         print()
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="HPD-Agent CLI — AI coding assistant with multi-agent planning."
+    )
+    parser.add_argument(
+        "-p", "--project",
+        metavar="PATH",
+        help="Set the working directory (cwd) for this session. "
+             "All git/project detection and tool operations use this path. "
+             "Example: python -m src.main -p /path/to/project",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = _parse_args()
+    if args.project:
+        os.chdir(os.path.expanduser(args.project))
     asyncio.run(run_loop())
 
 

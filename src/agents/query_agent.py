@@ -5,6 +5,8 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from src.core.state import AgentState
 from src.memory import ConversationContext, MessageRole, get_checkpointer
+from src.memory.session_store import _project_hash, delete as delete_session, list_sessions, load as load_session, save as save_session
+from src.system_info import build_boot_prompt
 from src.workflow import build_graph
 
 
@@ -21,8 +23,33 @@ class QueryAgent:
         self._app = graph.compile(checkpointer=checkpointer)
         self._contexts: dict[str, ConversationContext] = {}
         self._current_session: str = "default"
-        if "default" not in self._contexts:
-            self._contexts["default"] = ConversationContext()
+        self._session_boot_done: set[str] = set()
+        self._auto_save_enabled: bool = True
+        self._project_hash: str = _project_hash()
+        self._load_all()
+
+    def _load_all(self) -> None:
+        """Restore all persisted sessions for the current project from disk."""
+        for meta in list_sessions(self._project_hash):
+            sid = meta["session_id"]
+            ctx = load_session(sid, self._project_hash)
+            if ctx is not None:
+                self._contexts[sid] = ctx
+                self._session_boot_done.add(sid)
+
+    def save_current_session(self) -> None:
+        """Persist the current session to disk under the current project hash."""
+        save_session(self._get_context(), self._current_session, self._project_hash)
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session from memory and disk for the current project."""
+        self._contexts.pop(session_id, None)
+        self._session_boot_done.discard(session_id)
+        if self._current_session == session_id:
+            self._current_session = "default"
+            if "default" not in self._contexts:
+                self._contexts["default"] = ConversationContext()
+        return delete_session(session_id, self._project_hash)
 
     def _get_context(self, thread_id: str | None = None) -> ConversationContext:
         """Return the rolling context for this thread, creating if needed."""
@@ -79,6 +106,14 @@ class QueryAgent:
         ctx = self._get_context(sid)
         ctx.add_user_message(query)
 
+        if sid not in self._session_boot_done:
+            self._session_boot_done.add(sid)
+            from src.memory.context import Message
+            ctx.messages.insert(
+                0,
+                Message(role=MessageRole.ASSISTANT, content=build_boot_prompt()),
+            )
+
         initial_state: AgentState = {
             "input": query,
             "analysis": None,
@@ -118,6 +153,9 @@ class QueryAgent:
                 answer_content=final_text[:5000] if synthesis else None,
                 tool_summary=tool_summary or None,
             )
+
+        if self._auto_save_enabled:
+            save_session(ctx, sid, self._project_hash)
 
         return result
 
