@@ -9,9 +9,9 @@ HPD-Agent routes every incoming query through a two-tier assessment: simple task
 ## Quick Start
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
 cp .env.example .env        # set DEEPSEEK_API_KEY
-python -m src.main
+hpd
 ```
 
 ```
