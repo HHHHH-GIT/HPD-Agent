@@ -1,29 +1,8 @@
 # HPD-Agent
 
-A **Hierarchical Parallel Dynamic** agent framework for complex task execution, built with LangGraph and Python asyncio.
+**Hierarchical Parallel Dynamic Agent** — A multi-agent AI coding assistant that routes tasks intelligently and executes sub-tasks in parallel.
 
-HPD-Agent routes every incoming query through a two-tier assessment: simple tasks take a fast direct-answer path, while complex tasks are decomposed into a DAG and executed in parallel — reserving heavyweight computation for where it actually matters.
-
----
-
-## Quick Start
-
-```bash
-# pip install .
-pip install git+https://github.com/HHHHH-GIT/HPD-Agent.git
-cp .env.example .env        # set DEEPSEEK_API_KEY
-hpd
-```
-
-```
-> 你好
-# ... streamed response ...
-
-> /model create            # manage LLM profiles
-> /context                 # view context window
-> /new                     # start a fresh session
-> /exit                    # quit
-```
+Built on [LangGraph](https://langchain-ai.github.io/langgraph/), HPD-Agent implements a two-level hierarchical routing system that classifies tasks by complexity and executes independent sub-tasks concurrently using Kahn's topological algorithm.
 
 ---
 
@@ -33,191 +12,179 @@ hpd
 User Query
     │
     ▼
-┌─────────────────────┐
-│  first_level_assessment  │  ← Level-1: simple / complex
-└────────┬────────────┘
-         │
-    ┌────┴────┐
-    ▼         ▼
- simple    complex
-    │         │
-    ▼         ▼
-direct_   coordinator
-answer    (DAG planning)
-    │         │
-    ▼         ▼
-   END      scheduler_node
-             (Kahn parallel execution)
-                  │
-                  ▼
-              synthesizer
-              (streaming synthesis)
-                  │
-                  ▼
-                 END
+Level-1 Assessment (simple / complex)
+    │
+    ├── simple ──► Direct Answer (streaming, fast path)
+    │
+    └── complex ──► Coordinator Agent (DAG decomposition)
+                          │
+                          ▼
+                    Level-2 Assessment (easy / hard)
+                          │
+                          ▼
+                    Scheduler (parallel execution via Kahn's algorithm)
+                          │
+                          ▼
+                    Synthesizer (streaming final answer)
 ```
 
-**Execution paths**
+### Multi-Agent System
 
+| Agent | Role |
+|---|---|
+| **QueryAgent** | Public facade. Manages sessions, boots with system info, exposes the REPL. |
+| **CoordinatorAgent** | Decomposes complex queries into a DAG of sub-tasks with cycle detection. |
+| **ExpertAgent** | Executes individual sub-tasks, routing each through Level-2 assessment. |
 
-| Path   | Trigger              | Steps                                                         |
-| ------ | -------------------- | ------------------------------------------------------------- |
-| Direct | `simple` at Level-1  | assessment → direct_answer → END                              |
-| Full   | `complex` at Level-1 | assessment → coordinator → scheduler_node → synthesizer → END |
+### Agent Tools
 
+| Tool | Description |
+|---|---|
+| `read_file(path, lines=100)` | Read file contents with optional line limit |
+| `write_file(filename, content, append=True)` | Write or append to files |
+| `terminal(cmd)` | Execute shell commands; read-only commands are always allowed |
+| `project_scanner()` | Scan the current project structure and tech stack |
 
----
+### Routing Levels
 
-## Feature Checklist
-
-Based on the [HPD-Agent paper](./HPD-Agent.md).
-
-
-| #                            | Paper Feature                                            | Status          | Notes                                                                                 |
-| ---------------------------- | -------------------------------------------------------- | --------------- | ------------------------------------------------------------------------------------- |
-| **2.1 Hierarchical Routing** |                                                          |                 |                                                                                       |
-| 1                            | Level-1 assessment: simple / complex                     | **Implemented** | `src/nodes/assessment.py`                                                             |
-| 2                            | Level-2 assessment: easy / hard (per sub-task)           | **Implemented** | `src/nodes/execution.py`                                                              |
-| 3                            | Dynamic expert mode for hard sub-tasks                   | **Partial**     | Expert mode flag is tracked in state; self-reflection iteration loop is not yet wired |
-| **2.2 Parallel Execution**   |                                                          |                 |                                                                                       |
-| 4                            | DAG decomposition via LLM planner                        | **Implemented** | `src/nodes/planning.py`                                                               |
-| 5                            | Kahn topological sort                                    | **Implemented** | `src/nodes/scheduler.py`                                                              |
-| 6                            | In-degree-based ready-layer batching                     | **Implemented** | `src/nodes/scheduler.py`                                                              |
-| 7                            | `asyncio.gather` parallel execution                      | **Implemented** | `src/nodes/scheduler.py`                                                              |
-| 8                            | Exponential back-off retry (1s→2s→4s, cap 10s)           | **Implemented** | `src/nodes/scheduler.py`                                                              |
-| 9                            | Deadlock detection (empty ready queue, unfinished)       | **Implemented** | `src/nodes/scheduler.py`                                                              |
-| 10                           | DAG cycle detection + LLM retry (up to 3×)               | **Implemented** | `src/nodes/planning.py`                                                               |
-| 11                           | Thread-safe progress output (`threading.Lock`)           | **Implemented** | `src/nodes/scheduler.py`                                                              |
-| **2.3 Dynamic Expert Mode**  |                                                          |                 |                                                                                       |
-| 12                           | Multi-path generation (high-temperature candidates)      | Not yet         | Planned                                                                               |
-| 13                           | Dynamic weight assessment (task-type-aware metrics)      | Not yet         | Planned                                                                               |
-| 14                           | Multi-dimensional scoring (evaluation agent)             | Not yet         | Planned                                                                               |
-| 15                           | Self-reflection & iteration                              | Not yet         | Planned                                                                               |
-| 16                           | Fallback to cached best result on convergence failure    | Not yet         | Planned                                                                               |
-| **3+ Cross-cutting**         |                                                          |                 |                                                                                       |
-| 17                           | Full streaming output (all three paths)                  | **Implemented** | `direct_answer`, `executor`, `main.py`                                                |
-| 18                           | Per-project session isolation (SHA256 path hash)           | **Implemented** | `session_store.py` — `~/.hpagent/sessions/{hash}/`                                       |
-| 19                           | Multi-session management (create, list, switch)          | **Implemented** | `/sessions create/list/switch/delete`                                                   |
-| 20                           | Project knowledge scan & HPD.MD generation                 | **Implemented** | `/skim`, `project_scanner.py`                                                          |
-| 21                           | HPD.MD auto-injection into boot prompt                    | **Implemented** | `system_info.py`, `build_boot_prompt()`                                                |
-| 22                           | Context summarization                                     | **Implemented** | `/summary`                                                                            |
-| 23                           | Token-usage tracking (tiktoken)                          | **Implemented** | `/tokens`                                                                             |
-| 24                           | Multi-backend checkpointing (Memory / SQLite / Postgres) | **Implemented** | LangGraph Checkpointing                                                               |
-| 25                           | Model profile management (JSON, CLI)                     | **Implemented** | `/model` + `src/models/`                                                              |
-| 26                           | Multi-agent coordination (Coordinator + Expert agents)   | **Partial**     | Coordinator exists; Expert agents not yet separate                                    |
-| 27                           | Tool registry & tool-calling                             | Not yet         | Stub exists, not wired                                                                |
-| 28                           | Long-term memory (vector DB RAG)                         | Not yet         | Planned                                                                               |
-| 29                           | OpenTelemetry observability                              | Not yet         | Planned                                                                               |
-
-
----
-
-## Project Structure
-
-```
-src/
-├── __init__.py
-├── main.py                      # CLI entry point (REPL loop)
-├── run.py                       # direct runner (alternative entry)
-├── agents/
-│   ├── __init__.py
-│   ├── coordinator_agent.py     # coordinator node (LLM planning)
-│   ├── expert_agent.py          # expert agent for hard sub-tasks
-│   └── query_agent.py           # query agent
-├── commands/
-│   ├── __init__.py              # command registry & dispatcher
-│   ├── details.py               # help text for all commands
-│   └── handlers/
-│       ├── __init__.py
-│       ├── context_cmd.py        # /context
-│       ├── exit.py              # /exit
-│       ├── help.py              # /help
-│       ├── love.py              # easter egg
-│       ├── model_cmd.py         # /model (list/create/switch profiles)
-│       ├── new_session.py       # /new
-│       ├── sessions.py          # /sessions
-│       ├── summary.py           # /summary
-│       └── tokens.py            # /tokens
-├── core/
-│   ├── __init__.py
-│   ├── enums.py                 # TaskDifficulty enum
-│   ├── models.py                # all Pydantic data models
-│   └── state.py                 # AgentState TypedDict
-├── llm/
-│   ├── __init__.py
-│   ├── client.py                # ChatOpenAI factory (reads active model profile)
-│   └── prompts.py               # system prompts for each node
-├── memory/
-│   ├── __init__.py
-│   ├── checkpointer.py          # LangGraph checkpointer (Memory / SQLite / Postgres)
-│   ├── context.py               # ConversationContext & message history
-│   └── session_store.py         # per-project session persistence (~/.hpagent/sessions/{hash}/)
-├── models/
-│   ├── __init__.py
-│   └── store.py                 # ModelProfile JSON store + singleton
-├── nodes/
-│   ├── __init__.py
-│   ├── assessment.py            # first_level_assessment (simple / complex)
-│   ├── direct_answer.py         # direct_answer (streaming for simple tasks)
-│   ├── execution.py             # sub-task executor (Level-2 assessment + LLM)
-│   ├── planning.py              # DAG decomposition (LLM + cycle check)
-│   ├── scheduler.py             # Kahn's algorithm + asyncio.gather parallel runner
-│   ├── scheduler_node.py        # graph node wrapper around scheduler
-│   └── synthesizer.py           # synthesis prompt builder
-├── tools/
-│   ├── __init__.py
-│   ├── project_scanner.py      # project structure & tech-stack scanner
-│   ├── read_file.py            # read file contents
-│   ├── write_file.py           # write / edit file contents
-│   ├── terminal.py             # shell command execution
-│   └── registry.py             # tool registry & tool-calling
-└── workflow/
-    ├── __init__.py
-    └── builder.py               # LangGraph StateGraph assembly
-```
+| Level | Classification | Path |
+|---|---|---|
+| **Level 1** | `simple` / `complex` | Simple → direct answer; Complex → Coordinator |
+| **Level 2** | `easy` / `hard` | Easy → single tool call; Hard → multi-step reasoning |
 
 ---
 
 ## Commands
 
+All commands are entered at the REPL prompt.
 
-| Command                  | Description                                                                |
-| ------------------------ | -------------------------------------------------------------------------- |
-| `/model list`                | List all saved LLM profiles                                   |
-| `/model create`             | Interactively create a new model profile                      |
-| `/model switch <name>`     | Switch to a saved model                                       |
-| `/context [-d] [-N]`        | View context window ( `-d`: full content, `*`: all, `-N`: last N messages) |
-| `/sessions list`            | List sessions for the current project                          |
-| `/sessions create`         | Start a new conversation session                               |
-| `/sessions switch <id>`    | Switch to a session by id                                     |
-| `/sessions delete <id>`    | Delete a session for the current project                       |
-| `/summary`               | Summarize context window and clear messages                                |
-| `/skim [path]`           | Scan the project and generate `HPD.MD` project knowledge summary           |
-| `/tokens`                | Show token usage of current context                                        |
-| `/exit`                  | Exit                                                                       |
-| `/help`                  | Show all commands                                                          |
+| Command | Description |
+|---|---|
+| `/help` | Show all available commands |
+| `/context [-c N] [-d]` | View the conversation context window |
+| `/exit` | Exit the agent |
+| `/model list` | List all saved LLM model configurations |
+| `/model create` | Interactively create a new model profile |
+| `/model switch <name>` | Switch to a different model configuration |
+| `/sessions list` | List all sessions for the current project |
+| `/sessions create` | Create a new session |
+| `/sessions switch <id>` | Switch to a different session |
+| `/sessions delete <id>` | Delete a session |
+| `/skim [path]` | Scan the project and generate `HPD.MD` knowledge summary |
+| `/summary` | Summarize context and reset the context window (saves tokens) |
+| `/tokens` | Show current token usage |
 
+---
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+Or run directly without installation:
+
+```bash
+python src/run.py
+python -m src.main -p /path/to/project
+```
 
 ---
 
 ## Configuration
 
-**Model profiles** are stored in `~/.hpagent/models.json` (created on first run; legacy `~/.evo_agent/models.json` is migrated automatically).
+### Environment Variables
 
-The default profile uses:
+Create a `.env` file in the project root:
 
+```bash
+# Option 1: DeepSeek
+DEEPSEEK_API_KEY=your_deepseek_api_key_here
 
-| Field    | Value                      |
-| -------- | -------------------------- |
-| Model    | `deepseek-v4-flash`        |
-| Base URL | `https://api.deepseek.com` |
-| API Key  | `DEEPSEEK_API_KEY` env var |
+# Option 2: DashScope (OpenAI-compatible)
+DASHSCOPE_API_KEY=your_dashscope_api_key_here
 
+# Option 3: Custom OpenAI-compatible endpoint
+CUSTOM_API_KEY=your_api_key_here
+```
 
-Add more profiles via `/model create`. Any explicitly-passed parameter in `get_llm()` overrides the active profile.
+### Model Profiles
+
+Model configurations are stored in `~/.hpagent/models.json`. The default profile uses:
+
+| Field | Default | Description |
+|---|---|---|
+| `name` | `"default"` | Profile identifier |
+| `model` | `"deepseek-v4-flash"` | Model name |
+| `base_url` | `"https://api.deepseek.com"` | API endpoint |
+| `api_key` | (from env) | API key |
+| `temperature` | `0.0` | Sampling temperature |
+| `thinking` | `"disabled"` | Enable/disable model thinking |
+
+Create additional profiles with `/model create`.
 
 ---
 
-## License
+## Session Management
 
-MIT — see [LICENSE](./LICENSE) for details.
+Sessions are isolated per project using SHA256 path hashing and stored in `~/.hpagent/sessions/`. Each session persists:
+
+- Full conversation history
+- LangGraph checkpoint state
+- Model configuration
+
+---
+
+## Project Knowledge (`/skim`)
+
+Running `/skim` scans your project and generates a `HPD.MD` file containing:
+
+- Project structure overview
+- Detected tech stack (Python, Node.js, Rust, Go, Java, C++, Unity, Godot)
+- Web frameworks (Vite, Webpack, Next.js, Astro)
+- Build tools and package managers
+- Docker and CI/CD configurations
+
+This file is automatically injected into the boot prompt as project context.
+
+---
+
+## Token Management
+
+HPD-Agent tracks token usage in real-time. Use these commands to manage your context window:
+
+- `/tokens` — View current token count and limits
+- `/summary` — Compress conversation history to save tokens
+- `/context` — Inspect and prune the context window
+
+---
+
+## LangGraph Checkpointing
+
+State is persisted across sessions. Supported backends:
+
+- **Memory** (default, no persistence)
+- **SQLite** — `LANGGRAPH_CHECKPOINT/sqlite`
+- **PostgreSQL** — `LANGGRAPH_CHECKPOINT/postgres`
+
+---
+
+## Dependencies
+
+```
+langchain-openai>=0.1.0
+langgraph>=0.2.0
+langgraph-checkpoint>=2.0.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+tiktoken>=0.7.0
+dacite>=0.8.0
+prompt_toolkit>=3.0.0
+```
+
+---
+
+## Related Documentation
+
+- [HPD-Agent Paper](HPD-Agent.md) — Detailed technical paper
+- [HPD.MD Template](HPD.MD) — Project knowledge summary format
