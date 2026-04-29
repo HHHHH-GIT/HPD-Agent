@@ -185,7 +185,11 @@ async def invoke_with_tools(
                     # print(f"[DEBUG] Tool '{name}' called")
                     result = tool.invoke(args)
                     success = not str(result).startswith("[Error]")
-                    print(f"[DEBUG] Tool '{name}' {'succeeded' if success else 'failed'}")
+                    if success:
+                        print(f"[DEBUG] Tool '{name}' succeeded")
+                    else:
+                        print(f"[DEBUG] Tool '{name}' failed:\n{str(result)[:4000]}")
+
             messages.append(AIMessage(content="", tool_calls=[call]))
             messages.append(ToolMessage(name=name, content=str(result), tool_call_id=call_id))
             # Include args in the log so downstream can parse which files were read

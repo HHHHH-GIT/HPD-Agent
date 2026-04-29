@@ -1,23 +1,59 @@
 # pyright: reportUnknownVariableType=false
-"""安全的 v1 apply_patch 工具。
+"""安全的 v2 apply_patch 工具。
 
-v1 格式只接受自定义补丁信封：以 ``*** Begin Patch`` 开始、以
-``*** End Patch`` 结束，中间按文件声明 ``*** Add File: path``、
-``*** Update File: path`` 或 ``*** Delete File: path``。Add 行必须以
-``+`` 开头；Update 使用显式计数的 ``@@ -old,count +new,count @@`` hunk，
-并按行号和原内容做严格匹配。
+v2 协议设计目标:让 LLM 一次写对补丁。
 
-安全边界：仅允许工作区内相对路径；拒绝上级目录跳转、``.git``、敏感
-凭据路径、符号链接、目录、非 UTF-8 目标、超限补丁和超过 1 MiB 的最终
-Add/Update 输出。真实应用会在写入前重新校验目标快照，失败时尝试同进程回滚；不承诺崩溃恢复或 fsync 持久性。
+格式概览
+~~~~~~~~
 
-``dry_run=True`` 会完整解析、校验并规划 Add/Update/Delete 摘要，但不会
-写入文件，也不会创建目录。
+::
 
-明确非目标（non-goals）：no git diff compatibility；``git diff`` /
-``diff --git``、``---``、``+++`` 片段会被拒绝。no fuzzy matching；hunk
-行号或原内容不匹配时不会模糊查找替代位置。no terminal hardening；
-terminal 调用的安全边界仍在 ``src.llm.client``，本工具不修改 terminal 逻辑。
+    *** Begin Patch
+    *** Update File: src/app.py
+    <<<<<<< SEARCH
+    def greet(name):
+        return "hello"
+    =======
+    def greet(name: str) -> str:
+        return f"hello {name}"
+    >>>>>>> REPLACE
+    *** Add File: src/util.py
+    <<<<<<< CONTENT
+    def noop():
+        pass
+    >>>>>>> END
+    *** Replace File: README.md
+    <<<<<<< CONTENT
+    # New README
+    >>>>>>> END
+    *** Delete File: legacy.py
+    *** End Patch
+
+四种文件操作:
+
+* ``*** Add File: path`` —— 新建文件;目标必须不存在。
+* ``*** Update File: path`` —— 局部修改;一个或多个 SEARCH/REPLACE 块。
+* ``*** Replace File: path`` —— 整体覆盖现有文件;目标必须存在。
+* ``*** Delete File: path`` —— 删除文件;目标必须存在。
+
+SEARCH 必须在目标文件中**按行精确且唯一**出现。空 SEARCH 仅在目标文件
+为空时合法(等价于整体写入空文件,等价于 Replace File)。多个块允许乱序
+提供,工具内部按行位置排序;块之间不能重叠。
+
+安全边界
+~~~~~~~~
+
+仅允许工作区内的安全相对路径;拒绝 ``..``、``~``、绝对路径、``.git``、敏感
+凭据命名、符号链接(包括父目录)、目录、非 UTF-8 目标、超限补丁(256 KiB)
+和超过 1 MiB 的最终输出。写入前重新校验目标快照;失败时同进程回滚。
+
+非目标(non-goals)
+~~~~~~~~~~~~~~~~~~
+
+* no git diff compatibility:不接受 ``diff --git`` / ``---`` / ``+++`` 片段。
+* no fuzzy matching:SEARCH 必须按行精确匹配;不会模糊查找替代位置。
+* no terminal hardening:terminal 调用的安全边界仍在 ``src.llm.client``,
+  本工具不修改 terminal 逻辑。
 """
 
 from dataclasses import dataclass, replace
@@ -36,17 +72,23 @@ from langchain_core.tools import tool
 
 BEGIN_MARKER = "*** Begin Patch"
 END_MARKER = "*** End Patch"
-EOF_MARKER = "\\ No newline at end of file"
+SEARCH_OPEN = "<<<<<<< SEARCH"
+SEARCH_DIVIDER = "======="
+REPLACE_CLOSE = ">>>>>>> REPLACE"
+CONTENT_OPEN = "<<<<<<< CONTENT"
+CONTENT_CLOSE = ">>>>>>> END"
+
 UTF8_BOM = b"\xef\xbb\xbf"
 PATCH_TEXT_LIMIT_BYTES = 256 * 1024
 TARGET_FILE_LIMIT_BYTES = 1024 * 1024
 
-NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
+# ──────────────── 错误码 ────────────────
 INVALID_PATCH = "INVALID_PATCH"
 INVALID_ENVELOPE = "INVALID_ENVELOPE"
 MALFORMED_SECTION = "MALFORMED_SECTION"
-MALFORMED_HUNK = "MALFORMED_HUNK"
+MALFORMED_BLOCK = "MALFORMED_BLOCK"
 DUPLICATE_FILE_OPERATION = "DUPLICATE_FILE_OPERATION"
+
 INVALID_PATH = "INVALID_PATH"
 SENSITIVE_PATH = "SENSITIVE_PATH"
 TARGET_IS_SYMLINK = "TARGET_IS_SYMLINK"
@@ -54,27 +96,31 @@ TARGET_TOO_LARGE = "TARGET_TOO_LARGE"
 PATCH_TOO_LARGE = "PATCH_TOO_LARGE"
 INVALID_UTF8 = "INVALID_UTF8"
 BINARY_CONTENT = "BINARY_CONTENT"
+
 TARGET_EXISTS = "TARGET_EXISTS"
 TARGET_MISSING = "TARGET_MISSING"
 TARGET_IS_DIRECTORY = "TARGET_IS_DIRECTORY"
+
 FINAL_TOO_LARGE = "FINAL_TOO_LARGE"
 MIXED_NEWLINES = "MIXED_NEWLINES"
-HUNK_MISMATCH = "HUNK_MISMATCH"
-HUNK_ORDER_ERROR = "HUNK_ORDER_ERROR"
-INVALID_EOF_MARKER = "INVALID_EOF_MARKER"
+
+# v2 匹配错误(替代 v1 的 HUNK_*)
+SEARCH_NOT_FOUND = "SEARCH_NOT_FOUND"
+AMBIGUOUS_MATCH = "AMBIGUOUS_MATCH"
+BLOCK_OVERLAP = "BLOCK_OVERLAP"
+EMPTY_SEARCH_NON_EMPTY_FILE = "EMPTY_SEARCH_NON_EMPTY_FILE"
+
 NOOP_PATCH = "NOOP_PATCH"
-UNSAFE_PATH = "UNSAFE_PATH"
 APPLY_FAILED = "APPLY_FAILED"
 CLEANUP_FAILED = "CLEANUP_FAILED"
 TARGET_CHANGED = "TARGET_CHANGED"
 ROLLBACK_FAILED = "ROLLBACK_FAILED"
 
 ERROR_CODES = (
-    NOT_IMPLEMENTED,
     INVALID_PATCH,
     INVALID_ENVELOPE,
     MALFORMED_SECTION,
-    MALFORMED_HUNK,
+    MALFORMED_BLOCK,
     DUPLICATE_FILE_OPERATION,
     INVALID_PATH,
     SENSITIVE_PATH,
@@ -88,22 +134,23 @@ ERROR_CODES = (
     TARGET_IS_DIRECTORY,
     FINAL_TOO_LARGE,
     MIXED_NEWLINES,
-    HUNK_MISMATCH,
-    HUNK_ORDER_ERROR,
-    INVALID_EOF_MARKER,
+    SEARCH_NOT_FOUND,
+    AMBIGUOUS_MATCH,
+    BLOCK_OVERLAP,
+    EMPTY_SEARCH_NON_EMPTY_FILE,
     NOOP_PATCH,
-    UNSAFE_PATH,
     APPLY_FAILED,
     CLEANUP_FAILED,
     TARGET_CHANGED,
     ROLLBACK_FAILED,
 )
 
-OperationKind = Literal["add", "update", "delete"]
-HunkLineKind = Literal["context", "add", "delete"]
+OperationKind = Literal["add", "update", "delete", "replace"]
 
-_SECTION_RE = re.compile(r"^\*\*\* (Add File|Update File|Delete File): (.+)$")
-_HUNK_RE = re.compile(r"^@@ -([0-9]+),([0-9]+) \+([0-9]+),([0-9]+) @@$")
+_SECTION_RE = re.compile(
+    r"^\*\*\* (Add File|Update File|Delete File|Replace File): (.+)$"
+)
+_GIT_DIFF_HINT_RE = re.compile(r"^(diff --git |--- |\+\+\+ |@@ )")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _WINDOWS_DRIVE_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -112,32 +159,49 @@ _ALLOWED_TEXT_CONTROL_BYTES = frozenset({0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x1B})
 _FILE_LOCKS_GUARD = threading.Lock()
 _FILE_LOCKS: dict[str, threading.Lock] = {}
 _SENSITIVE_PATH_TOKENS = frozenset(
-    {"secret", "secrets", "credential", "credentials", "*.env"}
+    {
+        "secret",
+        "secrets",
+        "credential",
+        "credentials",
+        "key",
+        "keys",
+        "apikey",
+        "apikeys",
+        "token",
+        "tokens",
+        "password",
+        "passwords",
+        "passwd",
+    }
 )
 
 
+# ──────────────── 数据类 ────────────────
 @dataclass(frozen=True)
-class PatchHunkLine:
-    kind: HunkLineKind
-    content: str
-    no_newline_at_end: bool = False
+class SearchReplaceBlock:
+    """Update File 中的一个搜索-替换块。
 
+    ``search_text`` 与 ``replace_text`` 是块内容的纯文本,内部统一使用
+    ``\\n`` 作为换行;实际写入时会被规整化为目标文件的换行风格。
+    """
 
-@dataclass(frozen=True)
-class PatchHunk:
-    old_start: int
-    old_count: int
-    new_start: int
-    new_count: int
-    lines: tuple[PatchHunkLine, ...]
+    search_text: str
+    replace_text: str
 
 
 @dataclass(frozen=True)
 class PatchOperation:
+    """单个文件操作的解析结果。
+
+    Add / Replace 操作使用 ``content`` 字段;Update 使用 ``blocks`` 字段;
+    Delete 两个字段都为空。
+    """
+
     kind: OperationKind
     path: str
-    added_lines: tuple[PatchHunkLine, ...] = ()
-    hunks: tuple[PatchHunk, ...] = ()
+    content: str = ""
+    blocks: tuple[SearchReplaceBlock, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -150,6 +214,8 @@ class ExistingFileContent:
     text: str
     byte_size: int
     has_utf8_bom: bool = False
+    newline: str = "\n"
+    has_trailing_newline: bool = True
 
 
 @dataclass(frozen=True)
@@ -216,19 +282,10 @@ class PlannedPatch:
 
 
 @dataclass(frozen=True)
-class _FileLine:
-    content: str
-    has_newline: bool = True
-    from_eof_marker: bool = False
-
-
-@dataclass(frozen=True)
-class _HunkPlan:
-    start_index: int
-    end_index: int
-    output_lines: tuple[_FileLine, ...]
-    added_lines: int
-    deleted_lines: int
+class _BlockMatch:
+    start_line: int
+    end_line: int  # exclusive
+    block: SearchReplaceBlock
 
 
 @dataclass(frozen=True)
@@ -251,16 +308,15 @@ class _ApplyState:
 class PatchError(ValueError):
     """可被模型修复的 apply_patch 失败。
 
-    这个异常会被工具入口捕获并格式化为结构化文本结果，而不是让
-    LangChain 工具调用只暴露一个笼统的 failed。字段设计目标是让 LLM
-    能根据失败信息重新读取目标区域、缩小 hunk、修正补丁后重试。
+    错误结构包含 code / message / phase / line / file / hint / expected /
+    actual 字段,便于 LLM 根据信息直接重写补丁,无需猜测。
     """
 
     code: str
     message: str
     line: int | None
     file: str | None
-    hunk: str | None
+    block: str | None
     expected: str | None
     actual: str | None
     hint: str | None
@@ -272,7 +328,7 @@ class PatchError(ValueError):
         *,
         line: int | None = None,
         file: str | None = None,
-        hunk: str | None = None,
+        block: str | None = None,
         expected: str | None = None,
         actual: str | None = None,
         hint: str | None = None,
@@ -281,7 +337,7 @@ class PatchError(ValueError):
         self.message = message
         self.line = line
         self.file = file
-        self.hunk = hunk
+        self.block = block
         self.expected = expected
         self.actual = actual
         self.hint = hint
@@ -300,13 +356,14 @@ class PatchError(ValueError):
             phase=phase,
             line=self.line,
             file=self.file,
-            hunk=self.hunk,
+            block=self.block,
             expected=self.expected,
             actual=self.actual,
             hint=self.hint or _error_hint(self.code),
         )
 
 
+# ──────────────── 错误格式化 ────────────────
 def _clip_debug_text(text: str, limit: int = 1600) -> str:
     if len(text) <= limit:
         return text
@@ -327,7 +384,7 @@ def _format_error(
     phase: str | None = None,
     line: int | None = None,
     file: str | None = None,
-    hunk: str | None = None,
+    block: str | None = None,
     expected: str | None = None,
     actual: str | None = None,
     hint: str | None = None,
@@ -342,8 +399,8 @@ def _format_error(
         lines.append(f"line: {line}")
     if file:
         lines.append(f"file: {file}")
-    if hunk:
-        lines.append(f"hunk: {hunk}")
+    if block:
+        lines.append(f"block: {block}")
     if expected is not None:
         lines.append("expected:")
         lines.append(_indent_block(_clip_debug_text(expected)))
@@ -359,14 +416,67 @@ def _format_warning(code: str, detail: str) -> str:
     return f"[Warning][APPLY_PATCH][{code}] {detail}"
 
 
-def _format_hunk_header(hunk: PatchHunk) -> str:
-    return (
-        f"@@ -{hunk.old_start},{hunk.old_count} "
-        + f"+{hunk.new_start},{hunk.new_count} @@"
-    )
+def _error_hint(code: str) -> str:
+    hints = {
+        TARGET_EXISTS: (
+            "如果要修改现有文件,请使用 *** Update File:;"
+            "如果要整体覆盖,请使用 *** Replace File:。"
+        ),
+        TARGET_MISSING: "请确认目标文件存在,或改用 *** Add File:。",
+        TARGET_IS_DIRECTORY: "请指定普通文件路径,不能指定目录。",
+        FINAL_TOO_LARGE: "请拆分补丁或缩小目标文件内容。",
+        SEARCH_NOT_FOUND: (
+            "请重新读取目标文件对应区域,使用精确原文(包含空格、缩进、标点)"
+            "构造 SEARCH 块。"
+        ),
+        AMBIGUOUS_MATCH: (
+            "SEARCH 在文件中出现多次。请扩大 SEARCH 的上下文范围,直到它在"
+            "目标文件中只出现一次。"
+        ),
+        BLOCK_OVERLAP: (
+            "多个 SEARCH 块在文件中的匹配区域重叠。请合并为一个块,"
+            "或重新选择不重叠的上下文。"
+        ),
+        EMPTY_SEARCH_NON_EMPTY_FILE: (
+            "空 SEARCH 块只能用于空文件。要整体覆盖现有文件,请使用 "
+            "*** Replace File:。"
+        ),
+        MALFORMED_BLOCK: (
+            "SEARCH/REPLACE 块格式应为:<<<<<<< SEARCH / 内容 / ======= / "
+            "内容 / >>>>>>> REPLACE。CONTENT 块格式应为:<<<<<<< CONTENT / "
+            "内容 / >>>>>>> END。"
+        ),
+        MALFORMED_SECTION: (
+            "请检查 *** Add/Update/Delete/Replace File: 行;Add 与 Replace "
+            "需要 CONTENT 块,Update 需要至少一个 SEARCH/REPLACE 块,Delete 不需要正文。"
+        ),
+        INVALID_ENVELOPE: (
+            "请输出完整 v2 patch:以 *** Begin Patch 开始,以 *** End Patch 结束。"
+            "不要使用 git diff 格式(diff --git / --- / +++ / @@)。"
+        ),
+        TARGET_CHANGED: "请重新读取目标文件后再生成补丁。",
+        ROLLBACK_FAILED: "请检查残留备份或临时文件后手动处理。",
+        APPLY_FAILED: "请检查权限、磁盘空间和目标路径状态。",
+        CLEANUP_FAILED: "补丁已成功写入,请检查并手动删除残留临时或备份文件。",
+        INVALID_PATH: "请使用工作区内的安全相对路径。",
+        SENSITIVE_PATH: "请不要通过补丁写入密钥、令牌或环境配置。",
+        BINARY_CONTENT: "apply_patch 只处理 UTF-8 文本文件;请不要补丁二进制内容。",
+        NOOP_PATCH: (
+            "补丁不会改变目标内容。如果目标已满足要求,无需修改;"
+            "否则请检查 SEARCH 块和 REPLACE 内容是否一致。"
+        ),
+        MIXED_NEWLINES: "请确保目标文件统一使用 LF 或 CRLF 换行。",
+        DUPLICATE_FILE_OPERATION: "每个文件在补丁中只能出现一次操作。",
+    }
+    return hints.get(code, "请检查补丁格式、路径和目标文件状态后重试。")
 
 
+# ──────────────── 解析器 ────────────────
 def parse_patch_text(patch_text: str) -> PatchDocument:
+    """把 v2 patch 文本解析为 PatchDocument。
+
+    严格模式:不接受 git diff 片段、不接受任何 v1 hunk 语法。
+    """
     _ = validate_patch_text_size(patch_text)
     lines = patch_text.splitlines()
     if not lines or lines[0] != BEGIN_MARKER:
@@ -376,7 +486,6 @@ def parse_patch_text(patch_text: str) -> PatchDocument:
             line=1,
             expected=BEGIN_MARKER,
             actual=lines[0] if lines else "<empty patch>",
-            hint="请输出完整 v1 patch 信封，不要输出 git diff。",
         )
 
     end_index = _find_end_marker(lines)
@@ -400,10 +509,22 @@ def parse_patch_text(patch_text: str) -> PatchDocument:
             index += 1
             continue
 
+        # 友好提示:用户误用了 git diff
+        if _GIT_DIFF_HINT_RE.match(line):
+            raise PatchError(
+                MALFORMED_SECTION,
+                "v2 patch does not accept git diff syntax",
+                line=line_number,
+                actual=line,
+            )
+
         section_match = _SECTION_RE.match(line)
         if section_match is None:
             raise PatchError(
-                MALFORMED_SECTION, "expected a file operation section", line=line_number
+                MALFORMED_SECTION,
+                "expected a file operation section (Add/Update/Delete/Replace File)",
+                line=line_number,
+                actual=line,
             )
 
         section_name = section_match.group(1)
@@ -422,11 +543,17 @@ def parse_patch_text(patch_text: str) -> PatchDocument:
 
         index += 1
         if section_name == "Add File":
-            operation, index = _parse_add_file(raw_path, body, index)
+            operation, index = _parse_content_section(
+                "add", raw_path, body, index, line_number
+            )
+        elif section_name == "Replace File":
+            operation, index = _parse_content_section(
+                "replace", raw_path, body, index, line_number
+            )
         elif section_name == "Update File":
-            operation, index = _parse_update_file(raw_path, body, index)
-        else:
-            operation, index = _parse_delete_file(raw_path, body, index)
+            operation, index = _parse_update_section(raw_path, body, index, line_number)
+        else:  # Delete File
+            operation, index = _parse_delete_section(raw_path, body, index, line_number)
         operations.append(operation)
 
     if not operations:
@@ -444,6 +571,415 @@ def validate_patch_text_size(patch_text: str) -> int:
     return patch_size
 
 
+def _find_end_marker(lines: list[str]) -> int:
+    for index, line in enumerate(lines[1:], start=1):
+        if line == END_MARKER:
+            return index
+    raise PatchError(
+        INVALID_ENVELOPE,
+        "patch is missing the end marker",
+        expected=END_MARKER,
+        hint="请确保补丁最后一行是 *** End Patch。",
+    )
+
+
+def _is_blank_separator(line: str) -> bool:
+    return not line.strip()
+
+
+def _find_next_section(lines: list[str], start_index: int) -> int:
+    """跳到下一个 *** 起始行的索引,或到达末尾。"""
+    index = start_index
+    while index < len(lines):
+        if lines[index].startswith("*** "):
+            return index
+        index += 1
+    return index
+
+
+def _parse_content_section(
+    kind: OperationKind,
+    path: str,
+    lines: list[str],
+    start_index: int,
+    section_line_number: int,
+) -> tuple[PatchOperation, int]:
+    """解析 Add File / Replace File 的 CONTENT 块。"""
+    end_index = _find_next_section(lines, start_index)
+    cursor = start_index
+    while cursor < end_index and _is_blank_separator(lines[cursor]):
+        cursor += 1
+
+    if cursor >= end_index or lines[cursor] != CONTENT_OPEN:
+        raise PatchError(
+            MALFORMED_SECTION,
+            f"{'Add' if kind == 'add' else 'Replace'} File requires a CONTENT block",
+            line=section_line_number,
+            expected=f"{CONTENT_OPEN} ... {CONTENT_CLOSE}",
+            actual=lines[cursor] if cursor < end_index else "<missing>",
+        )
+
+    content_start = cursor + 1
+    close_index = None
+    for probe in range(content_start, end_index):
+        if lines[probe] == CONTENT_CLOSE:
+            close_index = probe
+            break
+    if close_index is None:
+        raise PatchError(
+            MALFORMED_BLOCK,
+            f"CONTENT block missing closing marker {CONTENT_CLOSE}",
+            line=cursor + 2,
+        )
+
+    content_lines = lines[content_start:close_index]
+    content = "\n".join(content_lines)
+
+    # CONTENT 块后只允许空白
+    for tail in range(close_index + 1, end_index):
+        if not _is_blank_separator(lines[tail]):
+            raise PatchError(
+                MALFORMED_SECTION,
+                f"unexpected content after CONTENT block",
+                line=tail + 2,
+                actual=lines[tail],
+            )
+
+    return PatchOperation(kind=kind, path=path, content=content), end_index
+
+
+def _parse_update_section(
+    path: str,
+    lines: list[str],
+    start_index: int,
+    section_line_number: int,
+) -> tuple[PatchOperation, int]:
+    end_index = _find_next_section(lines, start_index)
+    blocks: list[SearchReplaceBlock] = []
+    cursor = start_index
+
+    while cursor < end_index:
+        if _is_blank_separator(lines[cursor]):
+            cursor += 1
+            continue
+        if lines[cursor] != SEARCH_OPEN:
+            raise PatchError(
+                MALFORMED_BLOCK,
+                f"expected {SEARCH_OPEN}",
+                line=cursor + 2,
+                actual=lines[cursor],
+            )
+        block, cursor = _parse_search_replace_block(lines, cursor, end_index)
+        blocks.append(block)
+
+    if not blocks:
+        raise PatchError(
+            MALFORMED_SECTION,
+            "Update File requires at least one SEARCH/REPLACE block",
+            line=section_line_number,
+            expected=f"{SEARCH_OPEN} ... {SEARCH_DIVIDER} ... {REPLACE_CLOSE}",
+        )
+
+    return PatchOperation(kind="update", path=path, blocks=tuple(blocks)), end_index
+
+
+def _parse_search_replace_block(
+    lines: list[str],
+    open_index: int,
+    section_end: int,
+) -> tuple[SearchReplaceBlock, int]:
+    divider_index = None
+    close_index = None
+    for probe in range(open_index + 1, section_end):
+        line = lines[probe]
+        if line == SEARCH_DIVIDER and divider_index is None:
+            divider_index = probe
+        elif line == REPLACE_CLOSE:
+            close_index = probe
+            break
+        elif line == SEARCH_OPEN:
+            raise PatchError(
+                MALFORMED_BLOCK,
+                "nested SEARCH block before previous block was closed",
+                line=probe + 2,
+            )
+    if divider_index is None:
+        raise PatchError(
+            MALFORMED_BLOCK,
+            f"SEARCH block missing divider {SEARCH_DIVIDER}",
+            line=open_index + 2,
+        )
+    if close_index is None:
+        raise PatchError(
+            MALFORMED_BLOCK,
+            f"SEARCH block missing closing marker {REPLACE_CLOSE}",
+            line=open_index + 2,
+        )
+
+    search_lines = lines[open_index + 1 : divider_index]
+    replace_lines = lines[divider_index + 1 : close_index]
+    return (
+        SearchReplaceBlock(
+            search_text="\n".join(search_lines),
+            replace_text="\n".join(replace_lines),
+        ),
+        close_index + 1,
+    )
+
+
+def _parse_delete_section(
+    path: str,
+    lines: list[str],
+    start_index: int,
+    section_line_number: int,
+) -> tuple[PatchOperation, int]:
+    end_index = _find_next_section(lines, start_index)
+    for probe in range(start_index, end_index):
+        if not _is_blank_separator(lines[probe]):
+            raise PatchError(
+                MALFORMED_SECTION,
+                "Delete File section does not accept a body",
+                line=probe + 2,
+                actual=lines[probe],
+            )
+    return PatchOperation(kind="delete", path=path), end_index
+
+
+# ──────────────── SEARCH/REPLACE 应用核心 ────────────────
+def apply_update_blocks(
+    existing_content: ExistingFileContent,
+    blocks: tuple[SearchReplaceBlock, ...],
+) -> UpdateApplyResult:
+    """把若干 SEARCH/REPLACE 块按行对齐应用到现有文本。
+
+    工作方式:
+
+    1. 把现有文本按行切分(保留空行)。
+    2. 对每个块的 SEARCH 在文件行序列中查找精确且唯一的连续匹配。
+    3. 验证不同块的匹配区间互不重叠。
+    4. 按行位置排序后,从后往前替换(避免位置失效)。
+
+    空 SEARCH 仅在文件本身为空时合法,等价于"在空文件中写入内容";
+    其它情况应使用 ``*** Replace File:``。
+    """
+    if not blocks:
+        raise PatchError(NOOP_PATCH, "更新补丁没有可应用的块")
+
+    file_lines = _split_lines_preserve(existing_content.text)
+    matches = _find_block_matches(file_lines, blocks)
+    _ensure_no_overlap(matches)
+
+    new_file_lines = _apply_matches(file_lines, matches)
+    final_text = _join_lines_preserve(
+        new_file_lines,
+        newline=existing_content.newline,
+        trailing_newline=existing_content.has_trailing_newline,
+    )
+    final_payload = final_text.encode("utf-8")
+    final_bytes = (
+        UTF8_BOM + final_payload if existing_content.has_utf8_bom else final_payload
+    )
+
+    # Re-render the original through the same join logic so the NOOP
+    # comparison is not fooled by the stripped trailing newline in
+    # existing_content.text.
+    original_text = _join_lines_preserve(
+        file_lines,
+        newline=existing_content.newline,
+        trailing_newline=existing_content.has_trailing_newline,
+    )
+    original_payload = original_text.encode("utf-8")
+    original_bytes = (
+        UTF8_BOM + original_payload
+        if existing_content.has_utf8_bom
+        else original_payload
+    )
+    _ensure_likely_text_bytes(final_bytes, subject="计划输出")
+    if final_bytes == original_bytes:
+        raise PatchError(NOOP_PATCH, "更新补丁不会改变目标内容")
+
+    added_lines = sum(len(_split_block_lines(b.replace_text)) for b in blocks)
+    deleted_lines = sum(len(_split_block_lines(b.search_text)) for b in blocks)
+    return UpdateApplyResult(
+        final_bytes=final_bytes,
+        stats=LineStats(
+            old_line_count=len(file_lines),
+            new_line_count=len(new_file_lines),
+            added_lines=added_lines,
+            deleted_lines=deleted_lines,
+        ),
+        newline=existing_content.newline,
+        has_utf8_bom=existing_content.has_utf8_bom,
+    )
+
+
+def _split_lines_preserve(text: str) -> list[str]:
+    """按 \\n 切行,保留空行。空字符串返回空列表。"""
+    if text == "":
+        return []
+    return text.split("\n")
+
+
+def _join_lines_preserve(
+    file_lines: list[str], *, newline: str, trailing_newline: bool
+) -> str:
+    if not file_lines:
+        return ""
+    joined = newline.join(file_lines)
+    if trailing_newline:
+        joined += newline
+    return joined
+
+
+def _split_block_lines(text: str) -> list[str]:
+    """块内容按行切分(空字符串视为空列表)。"""
+    if text == "":
+        return []
+    return text.split("\n")
+
+
+def _detect_existing_newline(raw_text: str) -> tuple[str, bool, str]:
+    """识别现有文本的换行风格,并返回 (规整化后的 \\n 文本, trailing_newline, 原 newline)。
+
+    规整化逻辑:把 CRLF 统一替换为 LF;混合换行报错。
+    """
+    if raw_text == "":
+        return "", False, "\n"
+
+    has_lf = "\n" in raw_text
+    crlf_count = raw_text.count("\r\n")
+    lone_lf_count = raw_text.count("\n") - crlf_count
+    # 检查孤立 \r
+    stripped_crlf = raw_text.replace("\r\n", "\n")
+    if "\r" in stripped_crlf:
+        raise PatchError(MIXED_NEWLINES, "目标文件包含不支持的孤立 CR 换行")
+
+    if crlf_count > 0 and lone_lf_count > 0:
+        raise PatchError(MIXED_NEWLINES, "目标文件包含 LF 与 CRLF 混合换行")
+
+    newline = "\r\n" if crlf_count > 0 else "\n"
+    normalized = stripped_crlf
+    trailing_newline = has_lf and normalized.endswith("\n")
+    if trailing_newline:
+        normalized = normalized[:-1]
+    return normalized, trailing_newline, newline
+
+
+def _find_block_matches(
+    file_lines: list[str], blocks: tuple[SearchReplaceBlock, ...]
+) -> list[_BlockMatch]:
+    matches: list[_BlockMatch] = []
+    for index, block in enumerate(blocks):
+        search_lines = _split_block_lines(block.search_text)
+        if not search_lines:
+            if file_lines:
+                raise PatchError(
+                    EMPTY_SEARCH_NON_EMPTY_FILE,
+                    "空 SEARCH 块只能用于空文件",
+                    block=_block_label(index, block),
+                    hint=("要整体覆盖现有文件,请改用 *** Replace File:。"),
+                )
+            matches.append(_BlockMatch(start_line=0, end_line=0, block=block))
+            continue
+
+        positions = _find_all_line_matches(file_lines, search_lines)
+        if not positions:
+            raise PatchError(
+                SEARCH_NOT_FOUND,
+                "SEARCH 内容在目标文件中不存在",
+                block=_block_label(index, block),
+                expected=block.search_text,
+                actual=_clip_debug_text(
+                    _join_lines_preserve(
+                        file_lines, newline="\n", trailing_newline=False
+                    ),
+                    limit=800,
+                ),
+            )
+        if len(positions) > 1:
+            preview = ", ".join(f"line {p + 1}" for p in positions[:5])
+            raise PatchError(
+                AMBIGUOUS_MATCH,
+                f"SEARCH 在文件中匹配多次({len(positions)} 处)",
+                block=_block_label(index, block),
+                actual=preview,
+                hint=(
+                    "请扩大 SEARCH 的上下文,使它在目标文件中只出现一次;"
+                    "通常只需要在前后各加一两行原文即可。"
+                ),
+            )
+        start = positions[0]
+        matches.append(
+            _BlockMatch(
+                start_line=start, end_line=start + len(search_lines), block=block
+            )
+        )
+    return matches
+
+
+def _find_all_line_matches(file_lines: list[str], search_lines: list[str]) -> list[int]:
+    if not search_lines:
+        return []
+    n = len(search_lines)
+    if n > len(file_lines):
+        return []
+    positions: list[int] = []
+    first = search_lines[0]
+    for index in range(len(file_lines) - n + 1):
+        if file_lines[index] != first:
+            continue
+        if file_lines[index : index + n] == search_lines:
+            positions.append(index)
+    return positions
+
+
+def _ensure_no_overlap(matches: list[_BlockMatch]) -> None:
+    sorted_matches = sorted(matches, key=lambda m: m.start_line)
+    for left, right in zip(sorted_matches, sorted_matches[1:]):
+        if left.start_line == left.end_line and right.start_line == right.end_line:
+            # 两个空 SEARCH 块,理论上只允许出现一次(空文件只有一个匹配)
+            raise PatchError(
+                BLOCK_OVERLAP,
+                "多个空 SEARCH 块不能同时使用",
+                hint="一个 Update File 中只能有一个空 SEARCH 块。",
+            )
+        if left.end_line > right.start_line:
+            raise PatchError(
+                BLOCK_OVERLAP,
+                "多个 SEARCH 块的匹配区域重叠",
+                actual=(
+                    f"block A: lines {left.start_line + 1}-{left.end_line}; "
+                    f"block B: lines {right.start_line + 1}-{right.end_line}"
+                ),
+            )
+
+
+def _apply_matches(file_lines: list[str], matches: list[_BlockMatch]) -> list[str]:
+    sorted_matches = sorted(matches, key=lambda m: m.start_line)
+    new_lines: list[str] = []
+    cursor = 0
+    for match in sorted_matches:
+        new_lines.extend(file_lines[cursor : match.start_line])
+        new_lines.extend(_split_block_lines(match.block.replace_text))
+        cursor = match.end_line
+    new_lines.extend(file_lines[cursor:])
+    return new_lines
+
+
+def _block_label(index: int, block: SearchReplaceBlock) -> str:
+    preview = block.search_text.replace("\n", " ⏎ ")
+    if len(preview) > 60:
+        preview = preview[:57] + "..."
+    return f"block #{index + 1} (search: {preview})"
+
+
+def build_updated_file_bytes(
+    existing_content: ExistingFileContent, blocks: tuple[SearchReplaceBlock, ...]
+) -> bytes:
+    return apply_update_blocks(existing_content, blocks).final_bytes
+
+
+# ──────────────── 校验:路径 / 敏感性 / 工作区 ────────────────
 def validate_patch_document(
     document: PatchDocument,
     *,
@@ -486,932 +1022,6 @@ def validate_patch_document(
         operations=tuple(validated_operations),
         patch_text_size=patch_text_size,
     )
-
-
-def apply_update_hunks(
-    existing_content: ExistingFileContent,
-    hunks: tuple[PatchHunk, ...],
-) -> UpdateApplyResult:
-    if not hunks:
-        raise PatchError(NOOP_PATCH, "更新补丁没有可应用的 hunk")
-
-    original_lines, newline = _split_existing_lines(existing_content.text)
-    plans = _validate_update_hunks(original_lines, hunks)
-    output_lines = _build_output_lines(original_lines, plans)
-    final_text = _serialize_lines(output_lines, newline)
-    final_payload = final_text.encode("utf-8")
-    final_bytes = (
-        UTF8_BOM + final_payload if existing_content.has_utf8_bom else final_payload
-    )
-    original_payload = existing_content.text.encode("utf-8")
-    original_bytes = (
-        UTF8_BOM + original_payload
-        if existing_content.has_utf8_bom
-        else original_payload
-    )
-    _ensure_likely_text_bytes(final_bytes, subject="计划输出")
-
-    if final_bytes == original_bytes:
-        raise PatchError(NOOP_PATCH, "更新补丁不会改变目标内容")
-
-    return UpdateApplyResult(
-        final_bytes=final_bytes,
-        stats=LineStats(
-            old_line_count=len(original_lines),
-            new_line_count=len(output_lines),
-            added_lines=sum(plan.added_lines for plan in plans),
-            deleted_lines=sum(plan.deleted_lines for plan in plans),
-        ),
-        newline=newline,
-        has_utf8_bom=existing_content.has_utf8_bom,
-    )
-
-
-def build_updated_file_bytes(
-    existing_content: ExistingFileContent, hunks: tuple[PatchHunk, ...]
-) -> bytes:
-    return apply_update_hunks(existing_content, hunks).final_bytes
-
-
-def _split_existing_lines(text: str) -> tuple[tuple[_FileLine, ...], str]:
-    newline = _detect_newline_style(text)
-    if text == "":
-        return (), newline
-
-    parts = text.split(newline)
-    if text.endswith(newline):
-        return (
-            tuple(_FileLine(content=part, has_newline=True) for part in parts[:-1]),
-            newline,
-        )
-
-    lines = [_FileLine(content=part, has_newline=True) for part in parts[:-1]]
-    lines.append(_FileLine(content=parts[-1], has_newline=False))
-    return tuple(lines), newline
-
-
-def _detect_newline_style(text: str) -> str:
-    crlf_count = 0
-    lf_count = 0
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if char == "\r":
-            if index + 1 < len(text) and text[index + 1] == "\n":
-                crlf_count += 1
-                index += 2
-                continue
-            raise PatchError(MIXED_NEWLINES, "目标文件包含不支持的混合换行")
-        if char == "\n":
-            lf_count += 1
-        index += 1
-
-    if crlf_count and lf_count:
-        raise PatchError(MIXED_NEWLINES, "目标文件包含 LF 与 CRLF 混合换行")
-    return "\r\n" if crlf_count else "\n"
-
-
-def _validate_update_hunks(
-    original_lines: tuple[_FileLine, ...],
-    hunks: tuple[PatchHunk, ...],
-) -> tuple[_HunkPlan, ...]:
-    plans: list[_HunkPlan] = []
-    previous_end_index = 0
-    cumulative_delta = 0
-
-    for hunk in hunks:
-        _validate_hunk_accounting(hunk)
-        start_index, end_index = _hunk_original_span(hunk, len(original_lines))
-        if start_index < previous_end_index:
-            raise PatchError(HUNK_ORDER_ERROR, "hunk 必须按原文件位置排序且不能重叠")
-
-        expected_new_start = hunk.old_start + cumulative_delta
-        if hunk.old_count == 0:
-            if hunk.old_start == 0 and cumulative_delta != 0:
-                raise PatchError(
-                    HUNK_ORDER_ERROR, "文件开头插入只能出现在首个未偏移位置"
-                )
-            expected_new_start = hunk.old_start + cumulative_delta + 1
-        if hunk.new_start != expected_new_start:
-            raise PatchError(HUNK_ORDER_ERROR, "hunk 的 new_start 与累计行偏移不一致")
-
-        plan = _validate_hunk_against_original(
-            original_lines, hunk, start_index, end_index
-        )
-        plans.append(plan)
-        previous_end_index = max(previous_end_index, end_index)
-        cumulative_delta += hunk.new_count - hunk.old_count
-
-    return tuple(plans)
-
-
-def _validate_hunk_accounting(hunk: PatchHunk) -> None:
-    old_side_count = sum(1 for line in hunk.lines if line.kind != "add")
-    new_side_count = sum(1 for line in hunk.lines if line.kind != "delete")
-    if old_side_count != hunk.old_count or new_side_count != hunk.new_count:
-        raise PatchError(
-            HUNK_MISMATCH,
-            "hunk 行数与头部计数不一致",
-            hunk=_format_hunk_header(hunk),
-            expected=f"old_count={hunk.old_count}, new_count={hunk.new_count}",
-            actual=f"old_side_count={old_side_count}, new_side_count={new_side_count}",
-            hint="请重新计算 hunk header 中的 old_count/new_count；上下文行同时计入旧侧和新侧。",
-        )
-    if hunk.old_count == 0 and any(line.kind != "add" for line in hunk.lines):
-        raise PatchError(
-            HUNK_MISMATCH,
-            "零长度插入 hunk 只能包含新增行",
-            hunk=_format_hunk_header(hunk),
-            hint="old_count=0 的插入 hunk 只能包含以 + 开头的新增行。",
-        )
-
-
-def _hunk_original_span(hunk: PatchHunk, original_line_count: int) -> tuple[int, int]:
-    if hunk.old_count == 0:
-        if hunk.old_start < 0 or hunk.old_start > original_line_count:
-            raise PatchError(
-                HUNK_MISMATCH,
-                "插入位置超出原文件行数",
-                hunk=_format_hunk_header(hunk),
-                expected=f"old_start must be between 0 and {original_line_count}",
-                actual=f"old_start={hunk.old_start}",
-                hint="请重新读取目标文件行数后生成补丁。",
-            )
-        return hunk.old_start, hunk.old_start
-
-    if hunk.old_start < 1:
-        raise PatchError(
-            HUNK_MISMATCH,
-            "非插入 hunk 的 old_start 必须从 1 开始",
-            hunk=_format_hunk_header(hunk),
-            expected="old_start >= 1",
-            actual=f"old_start={hunk.old_start}",
-        )
-    start_index = hunk.old_start - 1
-    end_index = start_index + hunk.old_count
-    if end_index > original_line_count:
-        raise PatchError(
-            HUNK_MISMATCH,
-            "hunk 指向的原文件范围不存在",
-            hunk=_format_hunk_header(hunk),
-            expected=f"end_index <= original_line_count ({original_line_count})",
-            actual=f"end_index={end_index}",
-            hint="请重新读取目标文件相邻行，确认 hunk 的 old_start/old_count。",
-        )
-    return start_index, end_index
-
-
-def _validate_hunk_against_original(
-    original_lines: tuple[_FileLine, ...],
-    hunk: PatchHunk,
-    start_index: int,
-    end_index: int,
-) -> _HunkPlan:
-    old_index = start_index
-    output_lines: list[_FileLine] = []
-    added_lines = 0
-    deleted_lines = 0
-
-    for hunk_line in hunk.lines:
-        if hunk_line.kind != "add":
-            if old_index >= end_index:
-                raise PatchError(HUNK_MISMATCH, "hunk 旧侧行数超过声明范围")
-            original_line = original_lines[old_index]
-            if original_line.content != hunk_line.content:
-                raise PatchError(
-                    HUNK_MISMATCH,
-                    "hunk 旧侧内容与目标文件不匹配",
-                    hunk=_format_hunk_header(hunk),
-                    expected=hunk_line.content,
-                    actual=original_line.content,
-                    hint=(
-                        "请重新读取目标文件对应行，使用精确原文生成更小的 hunk；"
-                        "注意空格、中文标点、反引号和末尾换行。"
-                    ),
-                )
-            _validate_old_eof_marker(original_lines, old_index, hunk_line)
-            old_index += 1
-
-        if hunk_line.kind != "delete":
-            output_lines.append(
-                _FileLine(
-                    content=hunk_line.content,
-                    has_newline=not hunk_line.no_newline_at_end,
-                    from_eof_marker=hunk_line.no_newline_at_end,
-                )
-            )
-            if hunk_line.kind == "add":
-                added_lines += 1
-        else:
-            deleted_lines += 1
-
-    if old_index != end_index:
-        raise PatchError(HUNK_MISMATCH, "hunk 旧侧行数少于声明范围")
-
-    return _HunkPlan(
-        start_index=start_index,
-        end_index=end_index,
-        output_lines=tuple(output_lines),
-        added_lines=added_lines,
-        deleted_lines=deleted_lines,
-    )
-
-
-def _validate_old_eof_marker(
-    original_lines: tuple[_FileLine, ...],
-    old_index: int,
-    hunk_line: PatchHunkLine,
-) -> None:
-    original_line = original_lines[old_index]
-    is_final_original_line = old_index == len(original_lines) - 1
-    if hunk_line.no_newline_at_end:
-        if original_line.has_newline or not is_final_original_line:
-            raise PatchError(
-                INVALID_EOF_MARKER,
-                "EOF 标记必须匹配原文件最后一个无换行行",
-                expected="EOF marker only on the final original line without trailing newline",
-                actual=(
-                    f"is_final_original_line={is_final_original_line}, "
-                    + f"original_line_has_newline={original_line.has_newline}"
-                ),
-                hint="只有目标文件最后一行没有换行时，旧侧对应行才需要 EOF 标记。",
-            )
-        return
-    if not original_line.has_newline:
-        raise PatchError(
-            INVALID_EOF_MARKER,
-            "原文件无末尾换行时 hunk 必须显式 EOF 标记",
-            expected="old-side final line followed by '\\ No newline at end of file'",
-            actual="old-side final line omitted EOF marker",
-            hint="请在 hunk 中最后一个旧侧行后立即添加 EOF marker。",
-        )
-
-
-def _build_output_lines(
-    original_lines: tuple[_FileLine, ...],
-    plans: tuple[_HunkPlan, ...],
-) -> tuple[_FileLine, ...]:
-    output_lines: list[_FileLine] = []
-    cursor = 0
-    for plan in plans:
-        output_lines.extend(original_lines[cursor : plan.start_index])
-        output_lines.extend(plan.output_lines)
-        cursor = plan.end_index
-    output_lines.extend(original_lines[cursor:])
-    _validate_output_eof_markers(output_lines)
-    return tuple(output_lines)
-
-
-def _validate_output_eof_markers(output_lines: list[_FileLine]) -> None:
-    for index, line in enumerate(output_lines):
-        is_final_line = index == len(output_lines) - 1
-        if not line.has_newline and not is_final_line:
-            raise PatchError(INVALID_EOF_MARKER, "无换行行只能出现在输出末尾")
-        if line.from_eof_marker and not is_final_line:
-            raise PatchError(INVALID_EOF_MARKER, "EOF 标记只能作用于输出末尾行")
-
-
-def _serialize_lines(lines: tuple[_FileLine, ...], newline: str) -> str:
-    chunks: list[str] = []
-    for line in lines:
-        chunks.append(line.content)
-        if line.has_newline:
-            chunks.append(newline)
-    return "".join(chunks)
-
-
-def plan_patch_dry_run(patch_text: str) -> PlannedPatch:
-    document = parse_patch_text(patch_text)
-    workspace_root = Path.cwd().resolve()
-    acquired_locks = _acquire_document_locks(document, workspace_root)
-    try:
-        return _plan_patch_document_locked(document, patch_text, workspace_root)
-    finally:
-        _release_file_locks(acquired_locks)
-
-
-def _plan_patch_document_locked(
-    document: PatchDocument,
-    patch_text: str,
-    workspace_root: Path,
-) -> PlannedPatch:
-    validated_patch = validate_patch_document(
-        document,
-        patch_text=patch_text,
-        workspace_root=workspace_root,
-    )
-    add_newline = _detect_patch_newline_for_add(patch_text)
-    planned_operations: list[PlannedOperation] = []
-
-    for validated_operation in validated_patch.operations:
-        try:
-            planned_operations.append(_plan_operation(validated_operation, add_newline))
-        except PatchError as exc:
-            raise PatchError(
-                exc.code,
-                exc.message,
-                line=exc.line,
-                file=exc.file or validated_operation.relative_path.as_posix(),
-                hunk=exc.hunk,
-                expected=exc.expected,
-                actual=exc.actual,
-                hint=exc.hint,
-            ) from exc
-
-    return PlannedPatch(
-        operations=tuple(planned_operations),
-        total_final_size=sum(operation.final_size for operation in planned_operations),
-        workspace_root=validated_patch.workspace_root,
-    )
-
-
-def format_dry_run_result(planned_patch: PlannedPatch) -> str:
-    add_count = sum(
-        1 for operation in planned_patch.operations if operation.kind == "add"
-    )
-    update_count = sum(
-        1 for operation in planned_patch.operations if operation.kind == "update"
-    )
-    delete_count = sum(
-        1 for operation in planned_patch.operations if operation.kind == "delete"
-    )
-    lines = [
-        (
-            "[DRY-RUN OK] 补丁验证通过，计划 "
-            + f"{len(planned_patch.operations)} 个文件；Add {add_count}、"
-            + f"Update {update_count}、Delete {delete_count}。未写入文件。"
-        ),
-        "验证: 路径、安全、大小、UTF-8 与 hunk 检查已通过。",
-    ]
-    labels = {"add": "Add", "update": "Update", "delete": "Delete"}
-    for operation in planned_patch.operations:
-        lines.append(
-            f"- {labels[operation.kind]}: {operation.path} "
-            + f"(+{operation.stats.added_lines}/-{operation.stats.deleted_lines}, "
-            + f"final {operation.final_size} bytes)"
-        )
-    return "\n".join(lines)
-
-
-def _dry_run_patch_result(patch_text: str) -> str:
-    try:
-        return format_dry_run_result(plan_patch_dry_run(patch_text))
-    except PatchError as exc:
-        return _format_patch_error(exc, phase="dry-run")
-
-
-def apply_patch_to_files(patch_text: str) -> PlannedPatch:
-    document = parse_patch_text(patch_text)
-    workspace_root = Path.cwd().resolve()
-    acquired_locks = _acquire_document_locks(document, workspace_root)
-    try:
-        planned_patch = _plan_patch_document_locked(
-            document, patch_text, workspace_root
-        )
-        return _apply_planned_patch_locked(planned_patch)
-    finally:
-        _release_file_locks(acquired_locks)
-
-
-def _apply_planned_patch_locked(planned_patch: PlannedPatch) -> PlannedPatch:
-    _pre_write_revalidation_hook(planned_patch)
-    _revalidate_planned_patch(planned_patch)
-    state = _ApplyState(applied_operations=[], temp_paths=[], created_dirs=[])
-
-    try:
-        for operation in planned_patch.operations:
-            _apply_planned_operation(operation, state, planned_patch.workspace_root)
-    except PatchError:
-        _rollback_apply_state(state)
-        raise
-    except Exception as exc:
-        try:
-            _rollback_apply_state(state)
-        except PatchError as rollback_error:
-            raise rollback_error from exc
-        raise PatchError(APPLY_FAILED, f"应用补丁失败：{type(exc).__name__}") from exc
-
-    cleanup_warnings = _cleanup_success_paths(state)
-    return replace(planned_patch, warnings=cleanup_warnings)
-
-
-def _apply_patch_result(patch_text: str) -> str:
-    try:
-        planned_patch = apply_patch_to_files(patch_text)
-        return format_apply_result(planned_patch)
-    except PatchError as exc:
-        return _format_patch_error(exc, phase="apply")
-
-
-def format_apply_result(planned_patch: PlannedPatch) -> str:
-    add_count = sum(
-        1 for operation in planned_patch.operations if operation.kind == "add"
-    )
-    update_count = sum(
-        1 for operation in planned_patch.operations if operation.kind == "update"
-    )
-    delete_count = sum(
-        1 for operation in planned_patch.operations if operation.kind == "delete"
-    )
-    lines = [
-        (
-            "[OK] Applied patch: "
-            + f"{len(planned_patch.operations)} 个文件；Add {add_count}、"
-            + f"Update {update_count}、Delete {delete_count}。"
-        )
-    ]
-    labels = {"add": "Add", "update": "Update", "delete": "Delete"}
-    for operation in planned_patch.operations:
-        lines.append(
-            f"- {labels[operation.kind]}: {operation.path} "
-            + f"(+{operation.stats.added_lines}/-{operation.stats.deleted_lines}, "
-            + f"final {operation.final_size} bytes)"
-        )
-    for warning in planned_patch.warnings:
-        lines.append(_format_warning(CLEANUP_FAILED, warning))
-    return "\n".join(lines)
-
-
-def _plan_operation(
-    validated_operation: ValidatedOperation, add_newline: str
-) -> PlannedOperation:
-    operation = validated_operation.operation
-    if operation.kind == "add":
-        return _plan_add_operation(validated_operation, add_newline)
-    if operation.kind == "update":
-        return _plan_update_operation(validated_operation)
-    return _plan_delete_operation(validated_operation)
-
-
-def _plan_add_operation(
-    validated_operation: ValidatedOperation, add_newline: str
-) -> PlannedOperation:
-    original_snapshot = _capture_target_snapshot(validated_operation.target_path)
-    if original_snapshot.exists:
-        raise PatchError(TARGET_EXISTS, "新增目标已经存在；请改用 Update File")
-    final_bytes = _build_add_file_bytes(
-        validated_operation.operation.added_lines, add_newline
-    )
-    _ensure_final_size(final_bytes)
-    _ensure_likely_text_bytes(final_bytes, subject="新增输出")
-    line_count = len(validated_operation.operation.added_lines)
-    return PlannedOperation(
-        kind="add",
-        path=validated_operation.relative_path.as_posix(),
-        final_size=len(final_bytes),
-        stats=LineStats(
-            old_line_count=0,
-            new_line_count=line_count,
-            added_lines=line_count,
-            deleted_lines=0,
-        ),
-        target_path=validated_operation.target_path,
-        relative_path=validated_operation.relative_path,
-        final_bytes=final_bytes,
-        original_snapshot=original_snapshot,
-    )
-
-
-def _plan_update_operation(validated_operation: ValidatedOperation) -> PlannedOperation:
-    existing_content, original_snapshot = _read_existing_utf8_with_snapshot(
-        validated_operation.target_path
-    )
-    result = apply_update_hunks(existing_content, validated_operation.operation.hunks)
-    _ensure_final_size(result.final_bytes)
-    _ensure_likely_text_bytes(result.final_bytes, subject="更新输出")
-    return PlannedOperation(
-        kind="update",
-        path=validated_operation.relative_path.as_posix(),
-        final_size=len(result.final_bytes),
-        stats=result.stats,
-        target_path=validated_operation.target_path,
-        relative_path=validated_operation.relative_path,
-        final_bytes=result.final_bytes,
-        original_snapshot=original_snapshot,
-    )
-
-
-def _plan_delete_operation(validated_operation: ValidatedOperation) -> PlannedOperation:
-    existing_content, original_snapshot = _read_existing_utf8_with_snapshot(
-        validated_operation.target_path
-    )
-    original_lines, _newline = _split_existing_lines(existing_content.text)
-    deleted_lines = len(original_lines)
-    return PlannedOperation(
-        kind="delete",
-        path=validated_operation.relative_path.as_posix(),
-        final_size=0,
-        stats=LineStats(
-            old_line_count=deleted_lines,
-            new_line_count=0,
-            added_lines=0,
-            deleted_lines=deleted_lines,
-        ),
-        target_path=validated_operation.target_path,
-        relative_path=validated_operation.relative_path,
-        final_bytes=None,
-        original_snapshot=original_snapshot,
-    )
-
-
-def _build_add_file_bytes(
-    added_lines: tuple[PatchHunkLine, ...], newline: str
-) -> bytes:
-    if not added_lines:
-        return b""
-    text = "".join(line.content + newline for line in added_lines)
-    return text.encode("utf-8")
-
-
-def _detect_patch_newline_for_add(patch_text: str) -> str:
-    crlf_count = patch_text.count("\r\n")
-    lf_only_count = patch_text.count("\n") - crlf_count
-    return "\r\n" if crlf_count and not lf_only_count else "\n"
-
-
-def _ensure_final_size(final_bytes: bytes) -> None:
-    if len(final_bytes) > TARGET_FILE_LIMIT_BYTES:
-        raise PatchError(FINAL_TOO_LARGE, "计划输出超过 1 MiB 限制")
-
-
-def _ensure_likely_text_bytes(content: bytes, *, subject: str) -> None:
-    for byte in content:
-        if (byte < 0x20 or byte == 0x7F) and byte not in _ALLOWED_TEXT_CONTROL_BYTES:
-            raise PatchError(
-                BINARY_CONTENT, f"{subject}包含疑似二进制控制字节 0x{byte:02x}"
-            )
-
-
-def _format_patch_error(error: PatchError, *, phase: str) -> str:
-    return error.to_error_result(phase=phase)
-
-
-def _error_hint(code: str) -> str:
-    hints = {
-        TARGET_EXISTS: "如果要修改现有文件，请使用 Update File。",
-        TARGET_MISSING: "请确认目标文件存在，或改用 Add File。",
-        TARGET_IS_DIRECTORY: "请指定普通文件路径，不能指定目录。",
-        FINAL_TOO_LARGE: "请拆分补丁或缩小目标文件内容。",
-        HUNK_MISMATCH: "请根据目标文件当前内容重新生成 hunk；必要时先读取目标区域并缩小补丁。",
-        MALFORMED_HUNK: "请检查 hunk header 和每行前缀；不要使用 git diff 的 ---/+++ 格式。",
-        MALFORMED_SECTION: "请检查 Add/Update/Delete section 格式；Add File 正文每行都必须以 + 开头。",
-        INVALID_ENVELOPE: "请输出完整 v1 patch：以 *** Begin Patch 开始，以 *** End Patch 结束。",
-        HUNK_ORDER_ERROR: "请按原文件行号排序 hunk，且不要重叠。",
-        TARGET_CHANGED: "请重新读取目标文件后再生成补丁。",
-        ROLLBACK_FAILED: "请检查残留备份或临时文件后手动处理。",
-        APPLY_FAILED: "请检查权限、磁盘空间和目标路径状态。",
-        CLEANUP_FAILED: "补丁已成功写入，请检查并手动删除残留临时或备份文件。",
-        INVALID_PATH: "请使用工作区内的安全相对路径。",
-        SENSITIVE_PATH: "请不要通过补丁写入密钥、令牌或环境配置。",
-        BINARY_CONTENT: "apply_patch 只处理 UTF-8 文本文件；请不要补丁二进制内容。",
-    }
-    return hints.get(code, "请检查补丁格式、路径和目标文件状态后重试。")
-
-
-def _acquire_document_locks(
-    document: PatchDocument, workspace_root: Path
-) -> list[threading.Lock]:
-    lock_keys = _document_target_lock_keys(document, workspace_root)
-    return _acquire_file_locks(lock_keys)
-
-
-def _document_target_lock_keys(
-    document: PatchDocument, workspace_root: Path
-) -> tuple[str, ...]:
-    lock_keys: list[str] = []
-    for operation in document.operations:
-        relative_path = _validate_operation_path_syntax(
-            operation.path, workspace_root=workspace_root
-        )
-        _validate_existing_ancestors(workspace_root, relative_path)
-        target_path = _resolve_workspace_target(workspace_root, relative_path)
-        lock_keys.append(_target_lock_key(target_path))
-    return tuple(lock_keys)
-
-
-def _target_lock_key(target_path: Path) -> str:
-    return os.path.normcase(str(target_path.resolve(strict=False)))
-
-
-def _acquire_file_locks(lock_keys: tuple[str, ...]) -> list[threading.Lock]:
-    acquired_locks: list[threading.Lock] = []
-    for lock_key in sorted(set(lock_keys)):
-        file_lock = _get_file_lock(lock_key)
-        _ = file_lock.acquire()
-        acquired_locks.append(file_lock)
-    return acquired_locks
-
-
-def _get_file_lock(lock_key: str) -> threading.Lock:
-    with _FILE_LOCKS_GUARD:
-        file_lock = _FILE_LOCKS.get(lock_key)
-        if file_lock is None:
-            file_lock = threading.Lock()
-            _FILE_LOCKS[lock_key] = file_lock
-        return file_lock
-
-
-def _release_file_locks(acquired_locks: list[threading.Lock]) -> None:
-    for file_lock in reversed(acquired_locks):
-        file_lock.release()
-
-
-def _capture_target_snapshot(target_path: Path) -> TargetSnapshot:
-    try:
-        target_stat = target_path.lstat()
-    except FileNotFoundError:
-        return TargetSnapshot(exists=False, is_symlink=False, is_directory=False)
-
-    is_symlink = stat.S_ISLNK(target_stat.st_mode)
-    is_directory = stat.S_ISDIR(target_stat.st_mode)
-    file_hash = None
-    snapshot_stat = target_stat
-    if stat.S_ISREG(target_stat.st_mode) and not is_symlink:
-        existing_bytes, descriptor_stat = _read_regular_file_bytes_no_follow(
-            target_path
-        )
-        if _stat_identity(target_stat) != _stat_identity(descriptor_stat):
-            raise PatchError(TARGET_CHANGED, "目标文件在快照读取期间发生变化")
-        file_hash = hashlib.sha256(existing_bytes).hexdigest()
-        snapshot_stat = descriptor_stat
-    return TargetSnapshot(
-        exists=True,
-        is_symlink=is_symlink,
-        is_directory=is_directory,
-        size=snapshot_stat.st_size,
-        mtime_ns=snapshot_stat.st_mtime_ns,
-        mode=snapshot_stat.st_mode,
-        sha256=file_hash,
-    )
-
-
-def _pre_write_revalidation_hook(planned_patch: PlannedPatch) -> None:
-    _ = planned_patch
-
-
-def _before_target_open_hook(target_path: Path) -> None:
-    _ = target_path
-
-
-def _after_existing_bytes_read_hook(target_path: Path) -> None:
-    _ = target_path
-
-
-def _before_apply_operation_hook(operation: PlannedOperation) -> None:
-    _ = operation
-
-
-def _revalidate_planned_patch(planned_patch: PlannedPatch) -> None:
-    for operation in planned_patch.operations:
-        _revalidate_planned_operation(planned_patch.workspace_root, operation)
-
-
-def _revalidate_planned_operation(
-    workspace_root: Path, operation: PlannedOperation
-) -> None:
-    _validate_existing_ancestors(workspace_root, operation.relative_path)
-    target_path = _resolve_workspace_target(workspace_root, operation.relative_path)
-    if target_path != operation.target_path:
-        raise PatchError(TARGET_CHANGED, f"{operation.path}: 目标路径解析结果已变化")
-    current_snapshot = _capture_target_snapshot(operation.target_path)
-    if current_snapshot != operation.original_snapshot:
-        raise PatchError(TARGET_CHANGED, f"{operation.path}: 目标文件在验证后发生变化")
-
-
-def _validate_workspace_mutation_path(workspace_root: Path, path: Path) -> None:
-    try:
-        relative_path = path.relative_to(workspace_root)
-    except ValueError as exc:
-        raise PatchError(INVALID_PATH, "路径位于工作区之外") from exc
-
-    _validate_existing_ancestors(workspace_root, relative_path)
-    resolved_path = _resolve_workspace_target(workspace_root, relative_path)
-    if resolved_path != path.resolve(strict=False):
-        raise PatchError(TARGET_CHANGED, "路径解析结果已变化")
-
-
-def _apply_planned_operation(
-    operation: PlannedOperation, state: _ApplyState, workspace_root: Path
-) -> None:
-    _before_apply_operation_hook(operation)
-    _revalidate_planned_operation(workspace_root, operation)
-    if operation.kind == "add":
-        _apply_add_operation(operation, state, workspace_root)
-    elif operation.kind == "update":
-        _apply_update_operation(operation, state, workspace_root)
-    else:
-        _apply_delete_operation(operation, state, workspace_root)
-
-
-def _apply_add_operation(
-    operation: PlannedOperation, state: _ApplyState, workspace_root: Path
-) -> None:
-    if operation.final_bytes is None:
-        raise PatchError(APPLY_FAILED, f"{operation.path}: 新增内容缺失")
-    _create_missing_parent_dirs(operation.target_path.parent, state, workspace_root)
-    temp_path = _write_temp_file(
-        operation.target_path, operation.final_bytes, 0o644, state, workspace_root
-    )
-    _validate_workspace_mutation_path(workspace_root, operation.target_path)
-    os.replace(temp_path, operation.target_path)
-    state.applied_operations.append(
-        _AppliedOperation(
-            kind="add",
-            target_path=operation.target_path,
-            workspace_root=workspace_root,
-            relative_path=operation.relative_path,
-            added_path=operation.target_path,
-        )
-    )
-
-
-def _apply_update_operation(
-    operation: PlannedOperation, state: _ApplyState, workspace_root: Path
-) -> None:
-    if operation.final_bytes is None:
-        raise PatchError(APPLY_FAILED, f"{operation.path}: 更新内容缺失")
-    backup_path = _make_sidecar_path(
-        operation.target_path, "backup", state, workspace_root
-    )
-    _revalidate_planned_operation(workspace_root, operation)
-    os.replace(operation.target_path, backup_path)
-    state.applied_operations.append(
-        _AppliedOperation(
-            kind="update",
-            target_path=operation.target_path,
-            workspace_root=workspace_root,
-            relative_path=operation.relative_path,
-            backup_path=backup_path,
-        )
-    )
-    mode = (
-        operation.original_snapshot.mode
-        if operation.original_snapshot.mode is not None
-        else 0o644
-    )
-    temp_path = _write_temp_file(
-        operation.target_path, operation.final_bytes, mode, state, workspace_root
-    )
-    _validate_workspace_mutation_path(workspace_root, operation.target_path)
-    os.replace(temp_path, operation.target_path)
-
-
-def _apply_delete_operation(
-    operation: PlannedOperation, state: _ApplyState, workspace_root: Path
-) -> None:
-    backup_path = _make_sidecar_path(
-        operation.target_path, "backup", state, workspace_root
-    )
-    _revalidate_planned_operation(workspace_root, operation)
-    os.replace(operation.target_path, backup_path)
-    state.applied_operations.append(
-        _AppliedOperation(
-            kind="delete",
-            target_path=operation.target_path,
-            workspace_root=workspace_root,
-            relative_path=operation.relative_path,
-            backup_path=backup_path,
-        )
-    )
-
-
-def _create_missing_parent_dirs(
-    parent_path: Path, state: _ApplyState, workspace_root: Path
-) -> None:
-    try:
-        relative_parent = parent_path.relative_to(workspace_root)
-    except ValueError as exc:
-        raise PatchError(INVALID_PATH, "父目录位于工作区之外") from exc
-
-    current = workspace_root
-    for part in relative_parent.parts:
-        current = current / part
-        try:
-            current_stat = current.lstat()
-        except FileNotFoundError:
-            current.mkdir()
-            state.created_dirs.append(current)
-            continue
-        if stat.S_ISLNK(current_stat.st_mode):
-            raise PatchError(TARGET_IS_SYMLINK, "父目录不能是符号链接")
-        if not stat.S_ISDIR(current_stat.st_mode):
-            raise PatchError(INVALID_PATH, "父路径组件不是目录")
-
-
-def _make_sidecar_path(
-    target_path: Path, label: str, state: _ApplyState, workspace_root: Path
-) -> Path:
-    _validate_workspace_mutation_path(workspace_root, target_path)
-    file_descriptor, raw_path = tempfile.mkstemp(
-        prefix=f".{target_path.name}.apply-patch-{label}-",
-        dir=str(target_path.parent),
-    )
-    os.close(file_descriptor)
-    sidecar_path = Path(raw_path)
-    state.temp_paths.append(sidecar_path)
-    return sidecar_path
-
-
-def _write_temp_file(
-    target_path: Path,
-    content: bytes,
-    mode: int,
-    state: _ApplyState,
-    workspace_root: Path,
-) -> Path:
-    _validate_workspace_mutation_path(workspace_root, target_path)
-    file_descriptor, raw_path = tempfile.mkstemp(
-        prefix=f".{target_path.name}.apply-patch-temp-",
-        dir=str(target_path.parent),
-    )
-    temp_path = Path(raw_path)
-    state.temp_paths.append(temp_path)
-    try:
-        with os.fdopen(file_descriptor, "wb") as temp_file:
-            _ = temp_file.write(content)
-        _validate_workspace_mutation_path(workspace_root, temp_path)
-        os.chmod(temp_path, stat.S_IMODE(mode))
-    except Exception:
-        _remove_path_if_exists(temp_path)
-        raise
-    return temp_path
-
-
-def _rollback_apply_state(state: _ApplyState) -> None:
-    failures: list[str] = []
-    for operation in reversed(state.applied_operations):
-        try:
-            _rollback_operation(operation)
-        except Exception:
-            failures.append(_safe_display_path(operation.target_path))
-
-    for temp_path in reversed(state.temp_paths):
-        try:
-            _remove_path_if_exists(temp_path)
-        except Exception:
-            failures.append(_safe_display_path(temp_path))
-
-    for directory_path in reversed(state.created_dirs):
-        try:
-            if directory_path.exists():
-                directory_path.rmdir()
-        except OSError:
-            pass
-        except Exception:
-            failures.append(_safe_display_path(directory_path))
-
-    if failures:
-        residuals = ", ".join(failures[:5])
-        raise PatchError(ROLLBACK_FAILED, f"回滚失败；残留路径: {residuals}")
-
-
-def _rollback_operation(operation: _AppliedOperation) -> None:
-    if operation.kind == "add":
-        if operation.added_path is not None:
-            _validate_workspace_mutation_path(
-                operation.workspace_root, operation.added_path
-            )
-            _remove_path_if_exists(operation.added_path)
-        return
-
-    if operation.backup_path is None:
-        raise PatchError(ROLLBACK_FAILED, "备份文件缺失，无法回滚")
-    _validate_workspace_mutation_path(operation.workspace_root, operation.backup_path)
-    _validate_workspace_mutation_path(operation.workspace_root, operation.target_path)
-    if not operation.backup_path.exists():
-        raise PatchError(ROLLBACK_FAILED, "备份文件缺失，无法回滚")
-    _remove_path_if_exists(operation.target_path)
-    _validate_workspace_mutation_path(operation.workspace_root, operation.backup_path)
-    _validate_workspace_mutation_path(operation.workspace_root, operation.target_path)
-    os.replace(operation.backup_path, operation.target_path)
-
-
-def _cleanup_success_paths(state: _ApplyState) -> tuple[str, ...]:
-    failures: list[str] = []
-    for temp_path in reversed(state.temp_paths):
-        try:
-            _remove_path_if_exists(temp_path)
-        except Exception:
-            failures.append(_safe_display_path(temp_path))
-    if failures:
-        residuals = ", ".join(failures[:5])
-        return (f"补丁已应用，但清理临时或备份文件失败；残留路径: {residuals}",)
-    return ()
-
-
-def _remove_path_if_exists(path: Path) -> None:
-    _validate_workspace_mutation_path(Path.cwd().resolve(), path)
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-
-
-def _safe_display_path(path: Path) -> str:
-    try:
-        return path.relative_to(Path.cwd().resolve()).as_posix()
-    except ValueError:
-        return path.name
 
 
 def _validate_operation_path_syntax(
@@ -1541,7 +1151,7 @@ def _validate_target_state(
     except FileNotFoundError:
         if kind == "add":
             return None
-        raise PatchError(TARGET_MISSING, "更新或删除目标必须存在") from None
+        raise PatchError(TARGET_MISSING, "更新、覆盖或删除目标必须存在") from None
 
     if stat.S_ISLNK(target_stat.st_mode):
         raise PatchError(TARGET_IS_SYMLINK, "目标不能是符号链接")
@@ -1556,6 +1166,7 @@ def _validate_target_state(
         raise PatchError(TARGET_TOO_LARGE, "目标文件超过 1 MiB 限制")
     if kind == "update":
         return _read_existing_utf8(target_path, target_stat.st_size)
+    # replace / delete 不需要在此返回内容(replace 整体覆盖,delete 只需备份)
     return None
 
 
@@ -1563,7 +1174,144 @@ def _read_existing_utf8(target_path: Path, byte_size: int) -> ExistingFileConten
     existing_bytes, descriptor_stat = _read_regular_file_bytes_no_follow(target_path)
     if descriptor_stat.st_size != byte_size:
         raise PatchError(TARGET_CHANGED, "目标文件在读取期间发生变化")
-    return _decode_existing_utf8_bytes(existing_bytes, descriptor_stat.st_size)
+    return _decode_existing_utf8_bytes(existing_bytes)
+
+
+def _decode_existing_utf8_bytes(existing_bytes: bytes) -> ExistingFileContent:
+    has_utf8_bom = existing_bytes.startswith(UTF8_BOM)
+    payload = existing_bytes[len(UTF8_BOM) :] if has_utf8_bom else existing_bytes
+    try:
+        raw_text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PatchError(INVALID_UTF8, "目标文件不是有效的 UTF-8 文本") from exc
+    _ensure_likely_text_bytes(payload, subject="目标文件")
+    normalized_text, trailing_newline, newline = _detect_existing_newline(raw_text)
+    return ExistingFileContent(
+        text=normalized_text,
+        byte_size=len(existing_bytes),
+        has_utf8_bom=has_utf8_bom,
+        newline=newline,
+        has_trailing_newline=trailing_newline,
+    )
+
+
+def _ensure_likely_text_bytes(content: bytes, *, subject: str) -> None:
+    for byte in content:
+        if (byte < 0x20 or byte == 0x7F) and byte not in _ALLOWED_TEXT_CONTROL_BYTES:
+            raise PatchError(
+                BINARY_CONTENT, f"{subject}包含疑似二进制控制字节 0x{byte:02x}"
+            )
+
+
+def _ensure_final_size(final_bytes: bytes) -> None:
+    if len(final_bytes) > TARGET_FILE_LIMIT_BYTES:
+        raise PatchError(FINAL_TOO_LARGE, "计划输出超过 1 MiB 限制")
+
+
+# ──────────────── 文件锁 / 安全读取 ────────────────
+def _acquire_document_locks(
+    document: PatchDocument, workspace_root: Path
+) -> list[threading.Lock]:
+    lock_keys = _document_target_lock_keys(document, workspace_root)
+    return _acquire_file_locks(lock_keys)
+
+
+def _document_target_lock_keys(
+    document: PatchDocument, workspace_root: Path
+) -> tuple[str, ...]:
+    lock_keys: list[str] = []
+    for operation in document.operations:
+        relative_path = _validate_operation_path_syntax(
+            operation.path, workspace_root=workspace_root
+        )
+        _validate_existing_ancestors(workspace_root, relative_path)
+        target_path = _resolve_workspace_target(workspace_root, relative_path)
+        lock_keys.append(_target_lock_key(target_path))
+    return tuple(lock_keys)
+
+
+def _target_lock_key(target_path: Path) -> str:
+    return os.path.normcase(str(target_path.resolve(strict=False)))
+
+
+def _acquire_file_locks(lock_keys: tuple[str, ...]) -> list[threading.Lock]:
+    acquired_locks: list[threading.Lock] = []
+    for lock_key in sorted(set(lock_keys)):
+        file_lock = _get_file_lock(lock_key)
+        _ = file_lock.acquire()
+        acquired_locks.append(file_lock)
+    return acquired_locks
+
+
+def _get_file_lock(lock_key: str) -> threading.Lock:
+    with _FILE_LOCKS_GUARD:
+        file_lock = _FILE_LOCKS.get(lock_key)
+        if file_lock is None:
+            file_lock = threading.Lock()
+            _FILE_LOCKS[lock_key] = file_lock
+        return file_lock
+
+
+def _release_file_locks(acquired_locks: list[threading.Lock]) -> None:
+    for file_lock in reversed(acquired_locks):
+        file_lock.release()
+
+
+# ──────────────── 测试钩子 ────────────────
+def _pre_write_revalidation_hook(planned_patch: "PlannedPatch") -> None:
+    _ = planned_patch
+
+
+def _before_target_open_hook(target_path: Path) -> None:
+    _ = target_path
+
+
+def _after_existing_bytes_read_hook(target_path: Path) -> None:
+    _ = target_path
+
+
+def _before_apply_operation_hook(operation: "PlannedOperation") -> None:
+    _ = operation
+
+
+# ──────────────── 安全读取 ────────────────
+def _read_regular_file_bytes_no_follow(
+    target_path: Path,
+) -> tuple[bytes, os.stat_result]:
+    nofollow = cast(int | None, getattr(os, "O_NOFOLLOW", None))
+    if nofollow is None:
+        raise PatchError(TARGET_IS_SYMLINK, "当前平台不支持安全的无跟随读取")
+
+    _before_target_open_hook(target_path)
+    try:
+        file_descriptor = os.open(target_path, os.O_RDONLY | nofollow)
+    except FileNotFoundError as exc:
+        raise PatchError(TARGET_MISSING, "目标文件不存在") from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PatchError(TARGET_IS_SYMLINK, "目标不能是符号链接") from exc
+        if exc.errno == errno.ENOTDIR:
+            raise PatchError(INVALID_PATH, "目标父路径不是目录") from exc
+        raise PatchError(
+            APPLY_FAILED, f"无法安全读取目标文件:{type(exc).__name__}"
+        ) from exc
+
+    try:
+        descriptor_stat = os.fstat(file_descriptor)
+        if stat.S_ISDIR(descriptor_stat.st_mode):
+            raise PatchError(TARGET_IS_DIRECTORY, "目标不能是目录")
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise PatchError(INVALID_PATH, "目标必须是普通文件")
+
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks), descriptor_stat
+    finally:
+        os.close(file_descriptor)
 
 
 def _read_existing_utf8_with_snapshot(
@@ -1604,64 +1352,7 @@ def _read_existing_utf8_with_snapshot(
         mode=descriptor_stat.st_mode,
         sha256=hashlib.sha256(existing_bytes).hexdigest(),
     )
-    return (
-        _decode_existing_utf8_bytes(existing_bytes, descriptor_stat.st_size),
-        snapshot,
-    )
-
-
-def _read_regular_file_bytes_no_follow(
-    target_path: Path,
-) -> tuple[bytes, os.stat_result]:
-    nofollow = cast(int | None, getattr(os, "O_NOFOLLOW", None))
-    if nofollow is None:
-        raise PatchError(TARGET_IS_SYMLINK, "当前平台不支持安全的无跟随读取")
-
-    _before_target_open_hook(target_path)
-    try:
-        file_descriptor = os.open(target_path, os.O_RDONLY | nofollow)
-    except FileNotFoundError as exc:
-        raise PatchError(TARGET_MISSING, "目标文件不存在") from exc
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise PatchError(TARGET_IS_SYMLINK, "目标不能是符号链接") from exc
-        if exc.errno == errno.ENOTDIR:
-            raise PatchError(INVALID_PATH, "目标父路径不是目录") from exc
-        raise PatchError(
-            APPLY_FAILED, f"无法安全读取目标文件：{type(exc).__name__}"
-        ) from exc
-
-    try:
-        descriptor_stat = os.fstat(file_descriptor)
-        if stat.S_ISDIR(descriptor_stat.st_mode):
-            raise PatchError(TARGET_IS_DIRECTORY, "目标不能是目录")
-        if not stat.S_ISREG(descriptor_stat.st_mode):
-            raise PatchError(INVALID_PATH, "目标必须是普通文件")
-
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(file_descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return b"".join(chunks), descriptor_stat
-    finally:
-        os.close(file_descriptor)
-
-
-def _decode_existing_utf8_bytes(
-    existing_bytes: bytes, byte_size: int
-) -> ExistingFileContent:
-    has_utf8_bom = existing_bytes.startswith(UTF8_BOM)
-    payload = existing_bytes[len(UTF8_BOM) :] if has_utf8_bom else existing_bytes
-    try:
-        text = payload.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise PatchError(INVALID_UTF8, "目标文件不是有效的 UTF-8 文本") from exc
-    _ensure_likely_text_bytes(payload, subject="目标文件")
-    return ExistingFileContent(
-        text=text, byte_size=byte_size, has_utf8_bom=has_utf8_bom
-    )
+    return _decode_existing_utf8_bytes(existing_bytes), snapshot
 
 
 def _stat_identity(path_stat: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -1674,212 +1365,664 @@ def _stat_identity(path_stat: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def _find_end_marker(lines: list[str]) -> int:
-    for index, line in enumerate(lines[1:], start=1):
-        if line == END_MARKER:
-            return index
-    raise PatchError(
-        INVALID_ENVELOPE,
-        "patch is missing the end marker",
-        expected=END_MARKER,
-        hint="请确保补丁最后一行是 *** End Patch。",
+def _capture_target_snapshot(target_path: Path) -> TargetSnapshot:
+    try:
+        target_stat = target_path.lstat()
+    except FileNotFoundError:
+        return TargetSnapshot(exists=False, is_symlink=False, is_directory=False)
+
+    is_symlink = stat.S_ISLNK(target_stat.st_mode)
+    is_directory = stat.S_ISDIR(target_stat.st_mode)
+    file_hash = None
+    snapshot_stat = target_stat
+    if stat.S_ISREG(target_stat.st_mode) and not is_symlink:
+        existing_bytes, descriptor_stat = _read_regular_file_bytes_no_follow(
+            target_path
+        )
+        if _stat_identity(target_stat) != _stat_identity(descriptor_stat):
+            raise PatchError(TARGET_CHANGED, "目标文件在快照读取期间发生变化")
+        file_hash = hashlib.sha256(existing_bytes).hexdigest()
+        snapshot_stat = descriptor_stat
+    return TargetSnapshot(
+        exists=True,
+        is_symlink=is_symlink,
+        is_directory=is_directory,
+        size=snapshot_stat.st_size,
+        mtime_ns=snapshot_stat.st_mtime_ns,
+        mode=snapshot_stat.st_mode,
+        sha256=file_hash,
     )
 
 
-def _parse_add_file(
-    path: str,
-    lines: list[str],
-    start_index: int,
-) -> tuple[PatchOperation, int]:
-    end_index = _find_next_section(lines, start_index)
-    body_start, body_end = _trim_blank_separators(lines, start_index, end_index)
-    added_lines: list[PatchHunkLine] = []
+# ──────────────── 计划 / 应用 ────────────────
+def plan_patch_dry_run(patch_text: str) -> PlannedPatch:
+    document = parse_patch_text(patch_text)
+    workspace_root = Path.cwd().resolve()
+    acquired_locks = _acquire_document_locks(document, workspace_root)
+    try:
+        return _plan_patch_document_locked(document, patch_text, workspace_root)
+    finally:
+        _release_file_locks(acquired_locks)
 
-    for index in range(body_start, body_end):
-        line = lines[index]
-        if _is_blank_separator(line) or not line.startswith("+"):
+
+def _plan_patch_document_locked(
+    document: PatchDocument,
+    patch_text: str,
+    workspace_root: Path,
+) -> PlannedPatch:
+    validated_patch = validate_patch_document(
+        document,
+        patch_text=patch_text,
+        workspace_root=workspace_root,
+    )
+    add_newline = _detect_patch_newline_for_add(patch_text)
+    planned_operations: list[PlannedOperation] = []
+
+    for validated_operation in validated_patch.operations:
+        try:
+            planned_operations.append(_plan_operation(validated_operation, add_newline))
+        except PatchError as exc:
             raise PatchError(
-                MALFORMED_SECTION,
-                "Add File body lines must start with '+'",
-                line=index + 2,
-                file=path,
-                actual=line,
-                hint="Add File 的每一行正文都必须以 + 开头；空行也要写成 +。",
-            )
-        added_lines.append(PatchHunkLine(kind="add", content=line[1:]))
+                exc.code,
+                exc.message,
+                line=exc.line,
+                file=exc.file or validated_operation.relative_path.as_posix(),
+                block=exc.block,
+                expected=exc.expected,
+                actual=exc.actual,
+                hint=exc.hint,
+            ) from exc
 
-    return (
-        PatchOperation(kind="add", path=path, added_lines=tuple(added_lines)),
-        end_index,
+    return PlannedPatch(
+        operations=tuple(planned_operations),
+        total_final_size=sum(operation.final_size for operation in planned_operations),
+        workspace_root=validated_patch.workspace_root,
     )
 
 
-def _parse_update_file(
-    path: str,
-    lines: list[str],
-    start_index: int,
-) -> tuple[PatchOperation, int]:
-    end_index = _find_next_section(lines, start_index)
-    body_start, body_end = _trim_blank_separators(lines, start_index, end_index)
-    if body_start == body_end:
-        raise PatchError(MALFORMED_SECTION, "Update File requires at least one hunk")
-
-    hunks: list[PatchHunk] = []
-    index = body_start
-    while index < body_end:
-        line = lines[index]
-        if _is_blank_separator(line):
-            index += 1
-            continue
-        if _HUNK_RE.match(line) is None:
-            raise PatchError(
-                MALFORMED_HUNK, "expected a well-formed hunk header", line=index + 2
-            )
-        hunk, index = _parse_hunk(lines, index, body_end)
-        hunks.append(hunk)
-
-    if not hunks:
-        raise PatchError(MALFORMED_SECTION, "Update File requires at least one hunk")
-
-    return PatchOperation(kind="update", path=path, hunks=tuple(hunks)), end_index
+def _detect_patch_newline_for_add(patch_text: str) -> str:
+    crlf_count = patch_text.count("\r\n")
+    lf_only_count = patch_text.count("\n") - crlf_count
+    return "\r\n" if crlf_count and not lf_only_count else "\n"
 
 
-def _parse_delete_file(
-    path: str,
-    lines: list[str],
-    start_index: int,
-) -> tuple[PatchOperation, int]:
-    end_index = _find_next_section(lines, start_index)
-    body_start, body_end = _trim_blank_separators(lines, start_index, end_index)
-    if body_start != body_end:
+def _plan_operation(
+    validated_operation: ValidatedOperation, add_newline: str
+) -> PlannedOperation:
+    operation = validated_operation.operation
+    if operation.kind == "add":
+        return _plan_add_operation(validated_operation, add_newline)
+    if operation.kind == "update":
+        return _plan_update_operation(validated_operation)
+    if operation.kind == "replace":
+        return _plan_replace_operation(validated_operation, add_newline)
+    return _plan_delete_operation(validated_operation)
+
+
+def _plan_add_operation(
+    validated_operation: ValidatedOperation, add_newline: str
+) -> PlannedOperation:
+    original_snapshot = _capture_target_snapshot(validated_operation.target_path)
+    if original_snapshot.exists:
         raise PatchError(
-            MALFORMED_SECTION,
-            "Delete File section does not accept a body",
-            line=body_start + 2,
+            TARGET_EXISTS,
+            "新增目标已经存在",
+            hint="如果要整体覆盖现有文件,请使用 *** Replace File:。",
         )
-    return PatchOperation(kind="delete", path=path), end_index
-
-
-def _parse_hunk(
-    lines: list[str], header_index: int, section_end: int
-) -> tuple[PatchHunk, int]:
-    header = lines[header_index]
-    match = _HUNK_RE.match(header)
-    if match is None:
-        raise PatchError(MALFORMED_HUNK, "malformed hunk header", line=header_index + 2)
-
-    old_start = int(match.group(1))
-    old_count = int(match.group(2))
-    new_start = int(match.group(3))
-    new_count = int(match.group(4))
-    old_seen = 0
-    new_seen = 0
-    hunk_lines: list[PatchHunkLine] = []
-    last_body_line_index: int | None = None
-    index = header_index + 1
-
-    while index < section_end:
-        line = lines[index]
-        if line == EOF_MARKER:
-            if not hunk_lines or last_body_line_index != index - 1:
-                raise PatchError(
-                    MALFORMED_HUNK,
-                    "EOF marker must immediately follow a hunk body line",
-                    line=index + 2,
-                )
-            hunk_lines[-1] = replace(hunk_lines[-1], no_newline_at_end=True)
-            index += 1
-            continue
-
-        if old_seen == old_count and new_seen == new_count:
-            break
-
-        if not line or line[0] not in " +-":
-            raise PatchError(
-                MALFORMED_HUNK,
-                "hunk body lines must start with space, '-', or '+'",
-                line=index + 2,
-            )
-
-        prefix = line[0]
-        content = line[1:]
-        if prefix == " ":
-            old_seen += 1
-            new_seen += 1
-            kind: HunkLineKind = "context"
-        elif prefix == "-":
-            old_seen += 1
-            kind = "delete"
-        else:
-            new_seen += 1
-            kind = "add"
-
-        if old_seen > old_count or new_seen > new_count:
-            raise PatchError(
-                MALFORMED_HUNK, "hunk body exceeds header counts", line=index + 2
-            )
-
-        hunk_lines.append(PatchHunkLine(kind=kind, content=content))
-        last_body_line_index = index
-        index += 1
-
-    if old_seen != old_count or new_seen != new_count:
-        raise PatchError(
-            MALFORMED_HUNK,
-            "hunk body does not match header counts",
-            line=header_index + 2,
-            hunk=header,
-            expected=f"old_count={old_count}, new_count={new_count}",
-            actual=f"old_seen={old_seen}, new_seen={new_seen}",
-            hint="请检查 hunk body 每一行前缀：空格行同时计入旧/新，- 行只计入旧，+ 行只计入新。",
-        )
-
-    return (
-        PatchHunk(
-            old_start=old_start,
-            old_count=old_count,
-            new_start=new_start,
-            new_count=new_count,
-            lines=tuple(hunk_lines),
+    final_bytes = _serialize_new_file_bytes(
+        validated_operation.operation.content, add_newline
+    )
+    _ensure_final_size(final_bytes)
+    _ensure_likely_text_bytes(final_bytes, subject="新增输出")
+    line_count = (
+        len(_split_block_lines(validated_operation.operation.content))
+        if validated_operation.operation.content
+        else 0
+    )
+    return PlannedOperation(
+        kind="add",
+        path=validated_operation.relative_path.as_posix(),
+        final_size=len(final_bytes),
+        stats=LineStats(
+            old_line_count=0,
+            new_line_count=line_count,
+            added_lines=line_count,
+            deleted_lines=0,
         ),
-        index,
+        target_path=validated_operation.target_path,
+        relative_path=validated_operation.relative_path,
+        final_bytes=final_bytes,
+        original_snapshot=original_snapshot,
     )
 
 
-def _find_next_section(lines: list[str], start_index: int) -> int:
-    index = start_index
-    while index < len(lines):
-        if lines[index].startswith("*** "):
-            return index
-        index += 1
-    return index
+def _plan_update_operation(validated_operation: ValidatedOperation) -> PlannedOperation:
+    existing_content, original_snapshot = _read_existing_utf8_with_snapshot(
+        validated_operation.target_path
+    )
+    result = apply_update_blocks(existing_content, validated_operation.operation.blocks)
+    _ensure_final_size(result.final_bytes)
+    _ensure_likely_text_bytes(result.final_bytes, subject="更新输出")
+    return PlannedOperation(
+        kind="update",
+        path=validated_operation.relative_path.as_posix(),
+        final_size=len(result.final_bytes),
+        stats=result.stats,
+        target_path=validated_operation.target_path,
+        relative_path=validated_operation.relative_path,
+        final_bytes=result.final_bytes,
+        original_snapshot=original_snapshot,
+    )
 
 
-def _trim_blank_separators(
-    lines: list[str], start_index: int, end_index: int
-) -> tuple[int, int]:
-    while start_index < end_index and _is_blank_separator(lines[start_index]):
-        start_index += 1
-    while end_index > start_index and _is_blank_separator(lines[end_index - 1]):
-        end_index -= 1
-    return start_index, end_index
+def _plan_replace_operation(
+    validated_operation: ValidatedOperation, patch_newline: str
+) -> PlannedOperation:
+    existing_content, original_snapshot = _read_existing_utf8_with_snapshot(
+        validated_operation.target_path
+    )
+    # 复用原文件的换行风格,避免无意义的换行翻转
+    new_content = validated_operation.operation.content
+    final_text = _serialize_replace_text(new_content, existing_content)
+    final_payload = final_text.encode("utf-8")
+    final_bytes = (
+        UTF8_BOM + final_payload if existing_content.has_utf8_bom else final_payload
+    )
+    _ensure_final_size(final_bytes)
+    _ensure_likely_text_bytes(final_bytes, subject="覆盖输出")
+
+    original_text = _join_lines_preserve(
+        _split_lines_preserve(existing_content.text),
+        newline=existing_content.newline,
+        trailing_newline=existing_content.has_trailing_newline,
+    )
+    original_payload = original_text.encode("utf-8")
+    original_bytes = (
+        UTF8_BOM + original_payload
+        if existing_content.has_utf8_bom
+        else original_payload
+    )
+    if final_bytes == original_bytes:
+        raise PatchError(NOOP_PATCH, "覆盖内容与目标完全一致")
+
+    new_lines = _split_block_lines(new_content) if new_content else []
+    old_lines = _split_lines_preserve(existing_content.text)
+    return PlannedOperation(
+        kind="replace",
+        path=validated_operation.relative_path.as_posix(),
+        final_size=len(final_bytes),
+        stats=LineStats(
+            old_line_count=len(old_lines),
+            new_line_count=len(new_lines),
+            added_lines=len(new_lines),
+            deleted_lines=len(old_lines),
+        ),
+        target_path=validated_operation.target_path,
+        relative_path=validated_operation.relative_path,
+        final_bytes=final_bytes,
+        original_snapshot=original_snapshot,
+    )
 
 
-def _is_blank_separator(line: str) -> bool:
-    return not line.strip()
+def _plan_delete_operation(validated_operation: ValidatedOperation) -> PlannedOperation:
+    existing_content, original_snapshot = _read_existing_utf8_with_snapshot(
+        validated_operation.target_path
+    )
+    original_lines = _split_lines_preserve(existing_content.text)
+    deleted_lines = len(original_lines)
+    return PlannedOperation(
+        kind="delete",
+        path=validated_operation.relative_path.as_posix(),
+        final_size=0,
+        stats=LineStats(
+            old_line_count=deleted_lines,
+            new_line_count=0,
+            added_lines=0,
+            deleted_lines=deleted_lines,
+        ),
+        target_path=validated_operation.target_path,
+        relative_path=validated_operation.relative_path,
+        final_bytes=None,
+        original_snapshot=original_snapshot,
+    )
 
 
+def _serialize_new_file_bytes(content: str, newline: str) -> bytes:
+    """新建文件:始终以 newline 结尾(如果有内容)。"""
+    if content == "":
+        return b""
+    lines = content.split("\n")
+    text = newline.join(lines) + newline
+    return text.encode("utf-8")
+
+
+def _serialize_replace_text(
+    new_content: str, existing_content: ExistingFileContent
+) -> str:
+    """整体覆盖:沿用原文件的换行风格与末尾换行习惯。"""
+    if new_content == "":
+        return ""
+    lines = new_content.split("\n")
+    text = existing_content.newline.join(lines)
+    if existing_content.has_trailing_newline:
+        text += existing_content.newline
+    return text
+
+
+# ──────────────── 真实写入与回滚 ────────────────
+def apply_patch_to_files(patch_text: str) -> PlannedPatch:
+    document = parse_patch_text(patch_text)
+    workspace_root = Path.cwd().resolve()
+    acquired_locks = _acquire_document_locks(document, workspace_root)
+    try:
+        planned_patch = _plan_patch_document_locked(
+            document, patch_text, workspace_root
+        )
+        return _apply_planned_patch_locked(planned_patch)
+    finally:
+        _release_file_locks(acquired_locks)
+
+
+def _apply_planned_patch_locked(planned_patch: PlannedPatch) -> PlannedPatch:
+    _pre_write_revalidation_hook(planned_patch)
+    _revalidate_planned_patch(planned_patch)
+    state = _ApplyState(applied_operations=[], temp_paths=[], created_dirs=[])
+
+    try:
+        for operation in planned_patch.operations:
+            _apply_planned_operation(operation, state, planned_patch.workspace_root)
+    except PatchError:
+        _rollback_apply_state(state)
+        raise
+    except Exception as exc:
+        try:
+            _rollback_apply_state(state)
+        except PatchError as rollback_error:
+            raise rollback_error from exc
+        raise PatchError(APPLY_FAILED, f"应用补丁失败:{type(exc).__name__}") from exc
+
+    cleanup_warnings = _cleanup_success_paths(state)
+    return replace(planned_patch, warnings=cleanup_warnings)
+
+
+def _revalidate_planned_patch(planned_patch: PlannedPatch) -> None:
+    for operation in planned_patch.operations:
+        _revalidate_planned_operation(planned_patch.workspace_root, operation)
+
+
+def _revalidate_planned_operation(
+    workspace_root: Path, operation: PlannedOperation
+) -> None:
+    _validate_existing_ancestors(workspace_root, operation.relative_path)
+    target_path = _resolve_workspace_target(workspace_root, operation.relative_path)
+    if target_path != operation.target_path:
+        raise PatchError(TARGET_CHANGED, f"{operation.path}: 目标路径解析结果已变化")
+    current_snapshot = _capture_target_snapshot(operation.target_path)
+    if current_snapshot != operation.original_snapshot:
+        raise PatchError(TARGET_CHANGED, f"{operation.path}: 目标文件在验证后发生变化")
+
+
+def _validate_workspace_mutation_path(workspace_root: Path, path: Path) -> None:
+    try:
+        relative_path = path.relative_to(workspace_root)
+    except ValueError as exc:
+        raise PatchError(INVALID_PATH, "路径位于工作区之外") from exc
+
+    _validate_existing_ancestors(workspace_root, relative_path)
+    resolved_path = _resolve_workspace_target(workspace_root, relative_path)
+    if resolved_path != path.resolve(strict=False):
+        raise PatchError(TARGET_CHANGED, "路径解析结果已变化")
+
+
+def _apply_planned_operation(
+    operation: PlannedOperation, state: _ApplyState, workspace_root: Path
+) -> None:
+    _before_apply_operation_hook(operation)
+    _revalidate_planned_operation(workspace_root, operation)
+    if operation.kind == "add":
+        _apply_add_operation(operation, state, workspace_root)
+    elif operation.kind == "update":
+        _apply_update_or_replace_operation(operation, state, workspace_root)
+    elif operation.kind == "replace":
+        _apply_update_or_replace_operation(operation, state, workspace_root)
+    else:
+        _apply_delete_operation(operation, state, workspace_root)
+
+
+def _apply_add_operation(
+    operation: PlannedOperation, state: _ApplyState, workspace_root: Path
+) -> None:
+    if operation.final_bytes is None:
+        raise PatchError(APPLY_FAILED, f"{operation.path}: 新增内容缺失")
+    _create_missing_parent_dirs(operation.target_path.parent, state, workspace_root)
+    temp_path = _write_temp_file(
+        operation.target_path, operation.final_bytes, 0o644, state, workspace_root
+    )
+    _validate_workspace_mutation_path(workspace_root, operation.target_path)
+    os.replace(temp_path, operation.target_path)
+    state.applied_operations.append(
+        _AppliedOperation(
+            kind="add",
+            target_path=operation.target_path,
+            workspace_root=workspace_root,
+            relative_path=operation.relative_path,
+            added_path=operation.target_path,
+        )
+    )
+
+
+def _apply_update_or_replace_operation(
+    operation: PlannedOperation, state: _ApplyState, workspace_root: Path
+) -> None:
+    if operation.final_bytes is None:
+        raise PatchError(APPLY_FAILED, f"{operation.path}: 输出内容缺失")
+    backup_path = _make_sidecar_path(
+        operation.target_path, "backup", state, workspace_root
+    )
+    _revalidate_planned_operation(workspace_root, operation)
+    os.replace(operation.target_path, backup_path)
+    state.applied_operations.append(
+        _AppliedOperation(
+            kind=operation.kind,
+            target_path=operation.target_path,
+            workspace_root=workspace_root,
+            relative_path=operation.relative_path,
+            backup_path=backup_path,
+        )
+    )
+    mode = (
+        operation.original_snapshot.mode
+        if operation.original_snapshot.mode is not None
+        else 0o644
+    )
+    temp_path = _write_temp_file(
+        operation.target_path, operation.final_bytes, mode, state, workspace_root
+    )
+    _validate_workspace_mutation_path(workspace_root, operation.target_path)
+    os.replace(temp_path, operation.target_path)
+
+
+def _apply_delete_operation(
+    operation: PlannedOperation, state: _ApplyState, workspace_root: Path
+) -> None:
+    backup_path = _make_sidecar_path(
+        operation.target_path, "backup", state, workspace_root
+    )
+    _revalidate_planned_operation(workspace_root, operation)
+    os.replace(operation.target_path, backup_path)
+    state.applied_operations.append(
+        _AppliedOperation(
+            kind="delete",
+            target_path=operation.target_path,
+            workspace_root=workspace_root,
+            relative_path=operation.relative_path,
+            backup_path=backup_path,
+        )
+    )
+
+
+def _create_missing_parent_dirs(
+    parent_path: Path, state: _ApplyState, workspace_root: Path
+) -> None:
+    try:
+        relative_parent = parent_path.relative_to(workspace_root)
+    except ValueError as exc:
+        raise PatchError(INVALID_PATH, "父目录位于工作区之外") from exc
+
+    current = workspace_root
+    for part in relative_parent.parts:
+        current = current / part
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            current.mkdir()
+            state.created_dirs.append(current)
+            continue
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise PatchError(TARGET_IS_SYMLINK, "父目录不能是符号链接")
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise PatchError(INVALID_PATH, "父路径组件不是目录")
+
+
+def _make_sidecar_path(
+    target_path: Path, label: str, state: _ApplyState, workspace_root: Path
+) -> Path:
+    _validate_workspace_mutation_path(workspace_root, target_path)
+    file_descriptor, raw_path = tempfile.mkstemp(
+        prefix=f".{target_path.name}.apply-patch-{label}-",
+        dir=str(target_path.parent),
+    )
+    os.close(file_descriptor)
+    sidecar_path = Path(raw_path)
+    state.temp_paths.append(sidecar_path)
+    return sidecar_path
+
+
+def _write_temp_file(
+    target_path: Path,
+    content: bytes,
+    mode: int,
+    state: _ApplyState,
+    workspace_root: Path,
+) -> Path:
+    _validate_workspace_mutation_path(workspace_root, target_path)
+    file_descriptor, raw_path = tempfile.mkstemp(
+        prefix=f".{target_path.name}.apply-patch-temp-",
+        dir=str(target_path.parent),
+    )
+    temp_path = Path(raw_path)
+    state.temp_paths.append(temp_path)
+    try:
+        with os.fdopen(file_descriptor, "wb") as temp_file:
+            _ = temp_file.write(content)
+        _validate_workspace_mutation_path(workspace_root, temp_path)
+        os.chmod(temp_path, stat.S_IMODE(mode))
+    except Exception:
+        _remove_path_if_exists(temp_path)
+        raise
+    return temp_path
+
+
+def _rollback_apply_state(state: _ApplyState) -> None:
+    failures: list[str] = []
+    for operation in reversed(state.applied_operations):
+        try:
+            _rollback_operation(operation)
+        except Exception:
+            failures.append(_safe_display_path(operation.target_path))
+
+    for temp_path in reversed(state.temp_paths):
+        try:
+            _remove_path_if_exists(temp_path)
+        except Exception:
+            failures.append(_safe_display_path(temp_path))
+
+    for directory_path in reversed(state.created_dirs):
+        try:
+            if directory_path.exists():
+                directory_path.rmdir()
+        except OSError:
+            pass
+        except Exception:
+            failures.append(_safe_display_path(directory_path))
+
+    if failures:
+        residuals = ", ".join(failures[:5])
+        raise PatchError(ROLLBACK_FAILED, f"回滚失败;残留路径: {residuals}")
+
+
+def _rollback_operation(operation: _AppliedOperation) -> None:
+    if operation.kind == "add":
+        if operation.added_path is not None:
+            _validate_workspace_mutation_path(
+                operation.workspace_root, operation.added_path
+            )
+            _remove_path_if_exists(operation.added_path)
+        return
+
+    if operation.backup_path is None:
+        raise PatchError(ROLLBACK_FAILED, "备份文件缺失,无法回滚")
+    _validate_workspace_mutation_path(operation.workspace_root, operation.backup_path)
+    _validate_workspace_mutation_path(operation.workspace_root, operation.target_path)
+    if not operation.backup_path.exists():
+        raise PatchError(ROLLBACK_FAILED, "备份文件缺失,无法回滚")
+    _remove_path_if_exists(operation.target_path)
+    _validate_workspace_mutation_path(operation.workspace_root, operation.backup_path)
+    _validate_workspace_mutation_path(operation.workspace_root, operation.target_path)
+    os.replace(operation.backup_path, operation.target_path)
+
+
+def _cleanup_success_paths(state: _ApplyState) -> tuple[str, ...]:
+    failures: list[str] = []
+    for temp_path in reversed(state.temp_paths):
+        try:
+            _remove_path_if_exists(temp_path)
+        except Exception:
+            failures.append(_safe_display_path(temp_path))
+    if failures:
+        residuals = ", ".join(failures[:5])
+        return (f"补丁已应用,但清理临时或备份文件失败;残留路径: {residuals}",)
+    return ()
+
+
+def _remove_path_if_exists(path: Path) -> None:
+    _validate_workspace_mutation_path(Path.cwd().resolve(), path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _safe_display_path(path: Path) -> str:
+    try:
+        return path.relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return path.name
+
+
+# ──────────────── 结果格式化 ────────────────
+_OPERATION_LABELS: dict[OperationKind, str] = {
+    "add": "Add",
+    "update": "Update",
+    "replace": "Replace",
+    "delete": "Delete",
+}
+
+
+def format_dry_run_result(planned_patch: PlannedPatch) -> str:
+    counts = _count_operations(planned_patch.operations)
+    lines = [
+        (
+            "[DRY-RUN OK] 补丁验证通过,计划 "
+            + f"{len(planned_patch.operations)} 个文件;"
+            + f"Add {counts['add']}、Update {counts['update']}、"
+            + f"Replace {counts['replace']}、Delete {counts['delete']}。"
+            "未写入文件。"
+        ),
+        "验证: 路径、安全、大小、UTF-8 与 SEARCH 唯一性检查已通过。",
+    ]
+    for operation in planned_patch.operations:
+        lines.append(_format_planned_operation_line(operation))
+    return "\n".join(lines)
+
+
+def format_apply_result(planned_patch: PlannedPatch) -> str:
+    counts = _count_operations(planned_patch.operations)
+    lines = [
+        (
+            "[OK] Applied patch: "
+            + f"{len(planned_patch.operations)} 个文件;"
+            + f"Add {counts['add']}、Update {counts['update']}、"
+            + f"Replace {counts['replace']}、Delete {counts['delete']}。"
+        )
+    ]
+    for operation in planned_patch.operations:
+        lines.append(_format_planned_operation_line(operation))
+    for warning in planned_patch.warnings:
+        lines.append(_format_warning(CLEANUP_FAILED, warning))
+    return "\n".join(lines)
+
+
+def _count_operations(
+    operations: tuple[PlannedOperation, ...],
+) -> dict[OperationKind, int]:
+    counts: dict[OperationKind, int] = {
+        "add": 0,
+        "update": 0,
+        "replace": 0,
+        "delete": 0,
+    }
+    for operation in operations:
+        counts[operation.kind] += 1
+    return counts
+
+
+def _format_planned_operation_line(operation: PlannedOperation) -> str:
+    label = _OPERATION_LABELS[operation.kind]
+    return (
+        f"- {label}: {operation.path} "
+        f"(+{operation.stats.added_lines}/-{operation.stats.deleted_lines}, "
+        f"final {operation.final_size} bytes)"
+    )
+
+
+def _dry_run_patch_result(patch_text: str) -> str:
+    try:
+        return format_dry_run_result(plan_patch_dry_run(patch_text))
+    except PatchError as exc:
+        return _format_patch_error(exc, phase="dry-run")
+
+
+def _apply_patch_result(patch_text: str) -> str:
+    try:
+        planned_patch = apply_patch_to_files(patch_text)
+        return format_apply_result(planned_patch)
+    except PatchError as exc:
+        return _format_patch_error(exc, phase="apply")
+
+
+def _format_patch_error(error: PatchError, *, phase: str) -> str:
+    return error.to_error_result(phase=phase)
+
+
+# ──────────────── 工具入口 ────────────────
 @tool
 def apply_patch(patch_text: str, dry_run: bool = True) -> str:
-    """解析并应用 v1 apply_patch 补丁。
+    """解析并应用 v2 apply_patch 补丁(SEARCH/REPLACE 风格)。
 
-    v1 只支持 ``*** Begin Patch`` / ``*** End Patch`` 信封和 Add、Update、
-    Delete 文件操作；不兼容 ``git diff`` 或 ``diff --git``，也不做 fuzzy
-    matching。``dry_run=True`` 只返回规划摘要，不写入文件或创建目录。
+    协议要点
+    ~~~~~~~~
+
+    每个补丁以 ``*** Begin Patch`` 开始,以 ``*** End Patch`` 结束。中间是
+    一个或多个文件操作:
+
+    * ``*** Add File: path`` —— 新建文件(目标必须不存在),用 CONTENT 块。
+    * ``*** Update File: path`` —— 局部修改,用一个或多个 SEARCH/REPLACE 块。
+    * ``*** Replace File: path`` —— 整体覆盖现有文件,用 CONTENT 块。
+    * ``*** Delete File: path`` —— 删除文件,无正文。
+
+    SEARCH/REPLACE 块::
+
+        <<<<<<< SEARCH
+        old line(s) — 必须在文件中按行精确且唯一出现
+        =======
+        new line(s)
+        >>>>>>> REPLACE
+
+    CONTENT 块::
+
+        <<<<<<< CONTENT
+        file body — 原样写入,不需要 + 前缀
+        >>>>>>> END
+
+    不支持 ``diff --git`` / ``---`` / ``+++`` / ``@@`` 等 git diff 格式;
+    不做 fuzzy matching;SEARCH 不唯一时报 AMBIGUOUS_MATCH,不存在时报
+    SEARCH_NOT_FOUND——按错误信息扩大上下文或重读目标即可。
 
     Args:
-        patch_text: 需要校验、规划并可选应用的 v1 补丁文本。
-        dry_run: 为 True 时只执行 dry-run；为 False 时执行真实写入和回滚保护。
+        patch_text: v2 补丁文本。
+        dry_run: 为 True 时只校验并返回规划摘要,不写入文件;为 False 时
+            真实写入,并在失败时尝试回滚。
     """
     if dry_run:
         return _dry_run_patch_result(patch_text)
@@ -1895,12 +2038,11 @@ __all__ = [
     "format_dry_run_result",
     "apply_patch_to_files",
     "format_apply_result",
-    "apply_update_hunks",
+    "apply_update_blocks",
     "build_updated_file_bytes",
     "PatchDocument",
     "PatchOperation",
-    "PatchHunk",
-    "PatchHunkLine",
+    "SearchReplaceBlock",
     "ExistingFileContent",
     "ValidatedOperation",
     "ValidatedPatch",
@@ -1910,11 +2052,10 @@ __all__ = [
     "PlannedOperation",
     "PlannedPatch",
     "PatchError",
-    "NOT_IMPLEMENTED",
     "INVALID_PATCH",
     "INVALID_ENVELOPE",
     "MALFORMED_SECTION",
-    "MALFORMED_HUNK",
+    "MALFORMED_BLOCK",
     "DUPLICATE_FILE_OPERATION",
     "INVALID_PATH",
     "SENSITIVE_PATH",
@@ -1928,11 +2069,11 @@ __all__ = [
     "TARGET_IS_DIRECTORY",
     "FINAL_TOO_LARGE",
     "MIXED_NEWLINES",
-    "HUNK_MISMATCH",
-    "HUNK_ORDER_ERROR",
-    "INVALID_EOF_MARKER",
+    "SEARCH_NOT_FOUND",
+    "AMBIGUOUS_MATCH",
+    "BLOCK_OVERLAP",
+    "EMPTY_SEARCH_NON_EMPTY_FILE",
     "NOOP_PATCH",
-    "UNSAFE_PATH",
     "APPLY_FAILED",
     "CLEANUP_FAILED",
     "TARGET_CHANGED",
@@ -1940,4 +2081,12 @@ __all__ = [
     "PATCH_TEXT_LIMIT_BYTES",
     "TARGET_FILE_LIMIT_BYTES",
     "ERROR_CODES",
+    "UTF8_BOM",
+    "BEGIN_MARKER",
+    "END_MARKER",
+    "SEARCH_OPEN",
+    "SEARCH_DIVIDER",
+    "REPLACE_CLOSE",
+    "CONTENT_OPEN",
+    "CONTENT_CLOSE",
 ]
