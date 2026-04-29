@@ -28,6 +28,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import tempfile
+import threading
 from typing import Literal, cast
 
 from langchain_core.tools import tool
@@ -52,6 +53,7 @@ TARGET_IS_SYMLINK = "TARGET_IS_SYMLINK"
 TARGET_TOO_LARGE = "TARGET_TOO_LARGE"
 PATCH_TOO_LARGE = "PATCH_TOO_LARGE"
 INVALID_UTF8 = "INVALID_UTF8"
+BINARY_CONTENT = "BINARY_CONTENT"
 TARGET_EXISTS = "TARGET_EXISTS"
 TARGET_MISSING = "TARGET_MISSING"
 TARGET_IS_DIRECTORY = "TARGET_IS_DIRECTORY"
@@ -63,6 +65,7 @@ INVALID_EOF_MARKER = "INVALID_EOF_MARKER"
 NOOP_PATCH = "NOOP_PATCH"
 UNSAFE_PATH = "UNSAFE_PATH"
 APPLY_FAILED = "APPLY_FAILED"
+CLEANUP_FAILED = "CLEANUP_FAILED"
 TARGET_CHANGED = "TARGET_CHANGED"
 ROLLBACK_FAILED = "ROLLBACK_FAILED"
 
@@ -79,6 +82,7 @@ ERROR_CODES = (
     TARGET_TOO_LARGE,
     PATCH_TOO_LARGE,
     INVALID_UTF8,
+    BINARY_CONTENT,
     TARGET_EXISTS,
     TARGET_MISSING,
     TARGET_IS_DIRECTORY,
@@ -90,6 +94,7 @@ ERROR_CODES = (
     NOOP_PATCH,
     UNSAFE_PATH,
     APPLY_FAILED,
+    CLEANUP_FAILED,
     TARGET_CHANGED,
     ROLLBACK_FAILED,
 )
@@ -100,7 +105,12 @@ HunkLineKind = Literal["context", "add", "delete"]
 _SECTION_RE = re.compile(r"^\*\*\* (Add File|Update File|Delete File): (.+)$")
 _HUNK_RE = re.compile(r"^@@ -([0-9]+),([0-9]+) \+([0-9]+),([0-9]+) @@$")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+_WINDOWS_DRIVE_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _PATH_TOKEN_RE = re.compile(r"[._\-\s]+")
+_ALLOWED_TEXT_CONTROL_BYTES = frozenset({0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x1B})
+_FILE_LOCKS_GUARD = threading.Lock()
+_FILE_LOCKS: dict[str, threading.Lock] = {}
 _SENSITIVE_PATH_TOKENS = frozenset(
     {
         "secret",
@@ -211,6 +221,7 @@ class PlannedPatch:
     operations: tuple[PlannedOperation, ...]
     total_final_size: int
     workspace_root: Path
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -271,7 +282,12 @@ def _format_error(code: str, detail: str) -> str:
     return f"[Error] {code}: {detail}"
 
 
+def _format_warning(code: str, detail: str) -> str:
+    return f"[Warning] {code}: {detail}"
+
+
 def parse_patch_text(patch_text: str) -> PatchDocument:
+    _ = validate_patch_text_size(patch_text)
     lines = patch_text.splitlines()
     if not lines or lines[0] != BEGIN_MARKER:
         raise PatchError(
@@ -347,8 +363,11 @@ def validate_patch_document(
     document: PatchDocument,
     *,
     patch_text: str | None = None,
+    workspace_root: Path | None = None,
 ) -> ValidatedPatch:
-    workspace_root = Path.cwd().resolve()
+    workspace_root = (
+        Path.cwd().resolve() if workspace_root is None else workspace_root.resolve()
+    )
     patch_text_size = (
         validate_patch_text_size(patch_text) if patch_text is not None else None
     )
@@ -356,7 +375,9 @@ def validate_patch_document(
     seen_targets: set[Path] = set()
 
     for operation in document.operations:
-        relative_path = _validate_operation_path_syntax(operation.path)
+        relative_path = _validate_operation_path_syntax(
+            operation.path, workspace_root=workspace_root
+        )
         _validate_sensitive_path(relative_path)
         _validate_existing_ancestors(workspace_root, relative_path)
         target_path = _resolve_workspace_target(workspace_root, relative_path)
@@ -403,6 +424,7 @@ def apply_update_hunks(
         if existing_content.has_utf8_bom
         else original_payload
     )
+    _ensure_likely_text_bytes(final_bytes, subject="计划输出")
 
     if final_bytes == original_bytes:
         raise PatchError(NOOP_PATCH, "更新补丁不会改变目标内容")
@@ -622,7 +644,24 @@ def _serialize_lines(lines: tuple[_FileLine, ...], newline: str) -> str:
 
 def plan_patch_dry_run(patch_text: str) -> PlannedPatch:
     document = parse_patch_text(patch_text)
-    validated_patch = validate_patch_document(document, patch_text=patch_text)
+    workspace_root = Path.cwd().resolve()
+    acquired_locks = _acquire_document_locks(document, workspace_root)
+    try:
+        return _plan_patch_document_locked(document, patch_text, workspace_root)
+    finally:
+        _release_file_locks(acquired_locks)
+
+
+def _plan_patch_document_locked(
+    document: PatchDocument,
+    patch_text: str,
+    workspace_root: Path,
+) -> PlannedPatch:
+    validated_patch = validate_patch_document(
+        document,
+        patch_text=patch_text,
+        workspace_root=workspace_root,
+    )
     add_newline = _detect_patch_newline_for_add(patch_text)
     planned_operations: list[PlannedOperation] = []
 
@@ -678,7 +717,19 @@ def _dry_run_patch_result(patch_text: str) -> str:
 
 
 def apply_patch_to_files(patch_text: str) -> PlannedPatch:
-    planned_patch = plan_patch_dry_run(patch_text)
+    document = parse_patch_text(patch_text)
+    workspace_root = Path.cwd().resolve()
+    acquired_locks = _acquire_document_locks(document, workspace_root)
+    try:
+        planned_patch = _plan_patch_document_locked(
+            document, patch_text, workspace_root
+        )
+        return _apply_planned_patch_locked(planned_patch)
+    finally:
+        _release_file_locks(acquired_locks)
+
+
+def _apply_planned_patch_locked(planned_patch: PlannedPatch) -> PlannedPatch:
     _pre_write_revalidation_hook(planned_patch)
     _revalidate_planned_patch(planned_patch)
     state = _ApplyState(applied_operations=[], temp_paths=[], created_dirs=[])
@@ -696,8 +747,8 @@ def apply_patch_to_files(patch_text: str) -> PlannedPatch:
             raise rollback_error from exc
         raise PatchError(APPLY_FAILED, f"应用补丁失败：{type(exc).__name__}") from exc
 
-    _cleanup_success_paths(state)
-    return planned_patch
+    cleanup_warnings = _cleanup_success_paths(state)
+    return replace(planned_patch, warnings=cleanup_warnings)
 
 
 def _apply_patch_result(patch_text: str) -> str:
@@ -732,6 +783,8 @@ def format_apply_result(planned_patch: PlannedPatch) -> str:
             + f"(+{operation.stats.added_lines}/-{operation.stats.deleted_lines}, "
             + f"final {operation.final_size} bytes)"
         )
+    for warning in planned_patch.warnings:
+        lines.append(_format_warning(CLEANUP_FAILED, warning))
     return "\n".join(lines)
 
 
@@ -756,6 +809,7 @@ def _plan_add_operation(
         validated_operation.operation.added_lines, add_newline
     )
     _ensure_final_size(final_bytes)
+    _ensure_likely_text_bytes(final_bytes, subject="新增输出")
     line_count = len(validated_operation.operation.added_lines)
     return PlannedOperation(
         kind="add",
@@ -780,6 +834,7 @@ def _plan_update_operation(validated_operation: ValidatedOperation) -> PlannedOp
     )
     result = apply_update_hunks(existing_content, validated_operation.operation.hunks)
     _ensure_final_size(result.final_bytes)
+    _ensure_likely_text_bytes(result.final_bytes, subject="更新输出")
     return PlannedOperation(
         kind="update",
         path=validated_operation.relative_path.as_posix(),
@@ -835,6 +890,14 @@ def _ensure_final_size(final_bytes: bytes) -> None:
         raise PatchError(FINAL_TOO_LARGE, "计划输出超过 1 MiB 限制")
 
 
+def _ensure_likely_text_bytes(content: bytes, *, subject: str) -> None:
+    for byte in content:
+        if (byte < 0x20 or byte == 0x7F) and byte not in _ALLOWED_TEXT_CONTROL_BYTES:
+            raise PatchError(
+                BINARY_CONTENT, f"{subject}包含疑似二进制控制字节 0x{byte:02x}"
+            )
+
+
 def _format_patch_error(error: PatchError, *, phase: str) -> str:
     return f"{error.to_error_result()} 上下文: {phase} 阶段。提示: {_error_hint(error.code)}"
 
@@ -850,10 +913,60 @@ def _error_hint(code: str) -> str:
         TARGET_CHANGED: "请重新读取目标文件后再生成补丁。",
         ROLLBACK_FAILED: "请检查残留备份或临时文件后手动处理。",
         APPLY_FAILED: "请检查权限、磁盘空间和目标路径状态。",
+        CLEANUP_FAILED: "补丁已成功写入，请检查并手动删除残留临时或备份文件。",
         INVALID_PATH: "请使用工作区内的安全相对路径。",
         SENSITIVE_PATH: "请不要通过补丁写入密钥、令牌或环境配置。",
+        BINARY_CONTENT: "apply_patch 只处理 UTF-8 文本文件；请不要补丁二进制内容。",
     }
     return hints.get(code, "请检查补丁格式、路径和目标文件状态后重试。")
+
+
+def _acquire_document_locks(
+    document: PatchDocument, workspace_root: Path
+) -> list[threading.Lock]:
+    lock_keys = _document_target_lock_keys(document, workspace_root)
+    return _acquire_file_locks(lock_keys)
+
+
+def _document_target_lock_keys(
+    document: PatchDocument, workspace_root: Path
+) -> tuple[str, ...]:
+    lock_keys: list[str] = []
+    for operation in document.operations:
+        relative_path = _validate_operation_path_syntax(
+            operation.path, workspace_root=workspace_root
+        )
+        _validate_existing_ancestors(workspace_root, relative_path)
+        target_path = _resolve_workspace_target(workspace_root, relative_path)
+        lock_keys.append(_target_lock_key(target_path))
+    return tuple(lock_keys)
+
+
+def _target_lock_key(target_path: Path) -> str:
+    return os.path.normcase(str(target_path.resolve(strict=False)))
+
+
+def _acquire_file_locks(lock_keys: tuple[str, ...]) -> list[threading.Lock]:
+    acquired_locks: list[threading.Lock] = []
+    for lock_key in sorted(set(lock_keys)):
+        file_lock = _get_file_lock(lock_key)
+        _ = file_lock.acquire()
+        acquired_locks.append(file_lock)
+    return acquired_locks
+
+
+def _get_file_lock(lock_key: str) -> threading.Lock:
+    with _FILE_LOCKS_GUARD:
+        file_lock = _FILE_LOCKS.get(lock_key)
+        if file_lock is None:
+            file_lock = threading.Lock()
+            _FILE_LOCKS[lock_key] = file_lock
+        return file_lock
+
+
+def _release_file_locks(acquired_locks: list[threading.Lock]) -> None:
+    for file_lock in reversed(acquired_locks):
+        file_lock.release()
 
 
 def _capture_target_snapshot(target_path: Path) -> TargetSnapshot:
@@ -1126,7 +1239,7 @@ def _rollback_operation(operation: _AppliedOperation) -> None:
     os.replace(operation.backup_path, operation.target_path)
 
 
-def _cleanup_success_paths(state: _ApplyState) -> None:
+def _cleanup_success_paths(state: _ApplyState) -> tuple[str, ...]:
     failures: list[str] = []
     for temp_path in reversed(state.temp_paths):
         try:
@@ -1135,9 +1248,8 @@ def _cleanup_success_paths(state: _ApplyState) -> None:
             failures.append(_safe_display_path(temp_path))
     if failures:
         residuals = ", ".join(failures[:5])
-        raise PatchError(
-            APPLY_FAILED, f"补丁已应用，但清理临时或备份文件失败；残留路径: {residuals}"
-        )
+        return (f"补丁已应用，但清理临时或备份文件失败；残留路径: {residuals}",)
+    return ()
 
 
 def _remove_path_if_exists(path: Path) -> None:
@@ -1155,7 +1267,9 @@ def _safe_display_path(path: Path) -> str:
         return path.name
 
 
-def _validate_operation_path_syntax(raw_path: str) -> Path:
+def _validate_operation_path_syntax(
+    raw_path: str, *, workspace_root: Path | None = None
+) -> Path:
     if not raw_path or not raw_path.strip():
         raise PatchError(INVALID_PATH, "路径不能为空")
     if raw_path != raw_path.strip():
@@ -1164,11 +1278,44 @@ def _validate_operation_path_syntax(raw_path: str) -> Path:
         raise PatchError(INVALID_PATH, "路径不能包含控制字符")
     if raw_path.startswith("~"):
         raise PatchError(INVALID_PATH, "路径不能使用用户目录缩写")
-    if "\\" in raw_path:
-        raise PatchError(INVALID_PATH, "路径必须使用正斜杠分隔")
-    if raw_path.endswith("/"):
+
+    workspace_root = (
+        Path.cwd().resolve() if workspace_root is None else workspace_root.resolve()
+    )
+    if _WINDOWS_DRIVE_RE.match(raw_path):
+        return _validate_windows_drive_path(raw_path, workspace_root)
+
+    normalized_raw_path = raw_path.replace("\\", "/")
+    if normalized_raw_path.endswith("/"):
         raise PatchError(INVALID_PATH, "路径不能以目录分隔符结尾")
 
+    return _normalize_relative_operation_path(normalized_raw_path)
+
+
+def _validate_windows_drive_path(raw_path: str, workspace_root: Path) -> Path:
+    if not _WINDOWS_DRIVE_ABSOLUTE_RE.match(raw_path):
+        raise PatchError(INVALID_PATH, "Windows drive-relative 路径不安全")
+    if not _is_windows_runtime():
+        raise PatchError(INVALID_PATH, "Windows 盘符绝对路径必须位于当前工作区内")
+    relative_path = _windows_drive_absolute_to_relative(raw_path, workspace_root)
+    return _normalize_relative_operation_path(
+        relative_path.as_posix().replace("\\", "/")
+    )
+
+
+def _is_windows_runtime() -> bool:
+    return os.name == "nt"
+
+
+def _windows_drive_absolute_to_relative(raw_path: str, workspace_root: Path) -> Path:
+    target_path = Path(raw_path).resolve(strict=False)
+    try:
+        return target_path.relative_to(workspace_root)
+    except ValueError as exc:
+        raise PatchError(INVALID_PATH, "Windows 盘符路径位于工作区之外") from exc
+
+
+def _normalize_relative_operation_path(raw_path: str) -> Path:
     pure_path = PurePosixPath(raw_path)
     if pure_path.is_absolute():
         raise PatchError(INVALID_PATH, "路径必须相对工作区")
@@ -1364,6 +1511,7 @@ def _decode_existing_utf8_bytes(
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise PatchError(INVALID_UTF8, "目标文件不是有效的 UTF-8 文本") from exc
+    _ensure_likely_text_bytes(payload, subject="目标文件")
     return ExistingFileContent(
         text=text, byte_size=byte_size, has_utf8_bom=has_utf8_bom
     )
@@ -1615,6 +1763,7 @@ __all__ = [
     "TARGET_TOO_LARGE",
     "PATCH_TOO_LARGE",
     "INVALID_UTF8",
+    "BINARY_CONTENT",
     "TARGET_EXISTS",
     "TARGET_MISSING",
     "TARGET_IS_DIRECTORY",
@@ -1626,6 +1775,7 @@ __all__ = [
     "NOOP_PATCH",
     "UNSAFE_PATH",
     "APPLY_FAILED",
+    "CLEANUP_FAILED",
     "TARGET_CHANGED",
     "ROLLBACK_FAILED",
     "PATCH_TEXT_LIMIT_BYTES",

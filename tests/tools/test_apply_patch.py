@@ -4,6 +4,7 @@ import inspect
 import os
 from pathlib import Path
 import stat
+import threading
 from typing import Callable, Protocol, cast
 
 import pytest
@@ -32,6 +33,9 @@ from src.tools.apply_patch import (
     TARGET_TOO_LARGE,
     TARGET_CHANGED,
     APPLY_FAILED,
+    BINARY_CONTENT,
+    CLEANUP_FAILED,
+    ERROR_CODES,
     UTF8_BOM,
     ExistingFileContent,
     PatchDocument,
@@ -122,6 +126,90 @@ def test_path_allows_gitignore_and_github_and_env_example(
     ]
 
 
+def test_relative_windows_separators_normalize_to_posix_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    document = parse_patch_text(
+        _patch(
+            "*** Begin Patch",
+            "*** Add File: dir\\file.txt",
+            "+created",
+            "*** End Patch",
+        )
+    )
+
+    validated = validate_patch_document(document)
+    result = cast(
+        str,
+        apply_patch.invoke(
+            {
+                "patch_text": _patch(
+                    "*** Begin Patch",
+                    "*** Add File: nested\\child.txt",
+                    "+created",
+                    "*** End Patch",
+                ),
+                "dry_run": True,
+            }
+        ),
+    )
+
+    assert validated.operations[0].relative_path.as_posix() == "dir/file.txt"
+    assert "nested/child.txt" in result
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        "C:/outside.txt",
+        "C:\\outside.txt",
+        "C:relative.txt",
+        "C:dir\\file.txt",
+    ],
+)
+def test_windows_drive_paths_reject_unsafe_or_non_windows_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_path: str,
+):
+    monkeypatch.chdir(tmp_path)
+
+    _assert_validation_error(_add_document(raw_path), INVALID_PATH)
+
+
+def test_windows_drive_path_under_workspace_normalizes_when_windows_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+
+    def fake_drive_relative(raw_path: str, workspace_root: Path) -> Path:
+        assert raw_path == "C:\\workspace\\dir\\file.txt"
+        assert workspace_root == tmp_path.resolve()
+        return Path("dir\\file.txt")
+
+    monkeypatch.setattr(apply_patch_module, "_is_windows_runtime", lambda: True)
+    monkeypatch.setattr(
+        apply_patch_module,
+        "_windows_drive_absolute_to_relative",
+        fake_drive_relative,
+    )
+    document = parse_patch_text(
+        _patch(
+            "*** Begin Patch",
+            "*** Add File: C:\\workspace\\dir\\file.txt",
+            "+created",
+            "*** End Patch",
+        )
+    )
+
+    validated = validate_patch_document(document)
+
+    assert validated.operations[0].relative_path.as_posix() == "dir/file.txt"
+
+
 @pytest.mark.parametrize(
     "raw_path",
     [
@@ -129,7 +217,6 @@ def test_path_allows_gitignore_and_github_and_env_example(
         "../escape.txt",
         "safe/../escape.txt",
         "~/secret.txt",
-        "dir\\file.txt",
         "dir/",
         "bad\x00name.txt",
         "bad\x1fname.txt",
@@ -217,6 +304,10 @@ def test_rejects_patch_size_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert exc_info.value.code == PATCH_TOO_LARGE
 
 
+def test_parse_rejects_oversized_patch_before_envelope_scan():
+    _assert_parser_error("x" * (PATCH_TEXT_LIMIT_BYTES + 1), PATCH_TOO_LARGE)
+
+
 def test_rejects_existing_target_size_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -235,6 +326,62 @@ def test_rejects_invalid_utf8_update_target(
     _ = target.write_bytes(b"\xff")
 
     _assert_validation_error(_update_document("bad.txt"), INVALID_UTF8)
+
+
+def test_rejects_valid_utf8_binary_like_update_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "binary.txt"
+    _ = target.write_bytes(b"old\x00\n")
+
+    _assert_validation_error(_update_document("binary.txt"), BINARY_CONTENT)
+
+
+def test_dry_run_rejects_binary_like_final_add_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    patch_text = _patch(
+        "*** Begin Patch",
+        "*** Add File: binary.txt",
+        "+safe\x00binary",
+        "*** End Patch",
+    )
+
+    result = cast(str, apply_patch.invoke({"patch_text": patch_text, "dry_run": True}))
+
+    assert result.startswith(f"[Error] {BINARY_CONTENT}:")
+    assert not (tmp_path / "binary.txt").exists()
+
+
+def test_dry_run_rejects_binary_like_final_update_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "target.txt"
+    _ = target.write_text("old\n", encoding="utf-8")
+    patch_text = _patch(
+        "*** Begin Patch",
+        "*** Update File: target.txt",
+        "@@ -1,1 +1,1 @@",
+        "-old",
+        "+new\x01",
+        "*** End Patch",
+    )
+
+    result = cast(str, apply_patch.invoke({"patch_text": patch_text, "dry_run": True}))
+
+    assert result.startswith(f"[Error] {BINARY_CONTENT}:")
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_binary_and_cleanup_codes_are_exported():
+    assert BINARY_CONTENT in ERROR_CODES
+    assert CLEANUP_FAILED in ERROR_CODES
 
 
 def test_update_validation_preserves_utf8_bom_metadata(
@@ -793,6 +940,100 @@ def test_update_change_during_planning_rejects_stale_content_snapshot(
     assert target.read_bytes() == b"race\n"
 
 
+def test_same_file_concurrent_apply_is_serialized_by_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "target.txt"
+    _ = target.write_bytes(b"old\n")
+    patch_first = _patch(
+        "*** Begin Patch",
+        "*** Update File: target.txt",
+        "@@ -1,1 +1,1 @@",
+        "-old",
+        "+first",
+        "*** End Patch",
+    )
+    patch_second = _patch(
+        "*** Begin Patch",
+        "*** Update File: target.txt",
+        "@@ -1,1 +1,1 @@",
+        "-old",
+        "+second",
+        "*** End Patch",
+    )
+    first_holds_lock = threading.Event()
+    first_can_finish = threading.Event()
+    second_attempted_lock = threading.Event()
+    results: dict[str, str] = {}
+    errors: dict[str, BaseException] = {}
+    original_pre_write = cast(
+        Callable[[PlannedPatch], None],
+        apply_patch_module._pre_write_revalidation_hook,
+    )
+    original_acquire = cast(
+        Callable[[tuple[str, ...]], list[threading.Lock]],
+        apply_patch_module._acquire_file_locks,
+    )
+
+    def gate_first_apply(planned_patch: PlannedPatch) -> None:
+        original_pre_write(planned_patch)
+        if threading.current_thread().name == "apply-first":
+            first_holds_lock.set()
+            if not first_can_finish.wait(5):
+                raise AssertionError("first apply was not released")
+
+    def record_second_lock_attempt(lock_keys: tuple[str, ...]) -> list[threading.Lock]:
+        if threading.current_thread().name == "apply-second":
+            second_attempted_lock.set()
+        return original_acquire(lock_keys)
+
+    def run_apply(name: str, patch_text: str) -> None:
+        try:
+            results[name] = cast(
+                str,
+                apply_patch.invoke({"patch_text": patch_text, "dry_run": False}),
+            )
+        except BaseException as exc:
+            errors[name] = exc
+
+    monkeypatch.setattr(
+        apply_patch_module, "_pre_write_revalidation_hook", gate_first_apply
+    )
+    monkeypatch.setattr(
+        apply_patch_module, "_acquire_file_locks", record_second_lock_attempt
+    )
+
+    first_thread = threading.Thread(
+        target=run_apply,
+        args=("first", patch_first),
+        name="apply-first",
+    )
+    first_thread.start()
+    assert first_holds_lock.wait(5)
+
+    second_thread = threading.Thread(
+        target=run_apply,
+        args=("second", patch_second),
+        name="apply-second",
+    )
+    second_thread.start()
+    assert second_attempted_lock.wait(5)
+    assert second_thread.is_alive()
+
+    first_can_finish.set()
+    first_thread.join(5)
+    second_thread.join(5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == {}
+    assert results["first"].startswith("[OK] Applied patch")
+    assert results["second"].startswith(f"[Error] {HUNK_MISMATCH}:")
+    assert target.read_bytes() == b"first\n"
+
+
 def test_delete_change_during_planning_rejects_stale_content_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -821,7 +1062,7 @@ def test_delete_change_during_planning_rejects_stale_content_snapshot(
     assert target.read_bytes() == b"race\n"
 
 
-def test_success_cleanup_failure_returns_structured_apply_failed(
+def test_success_cleanup_failure_returns_cleanup_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -845,7 +1086,8 @@ def test_success_cleanup_failure_returns_structured_apply_failed(
 
     result = cast(str, apply_patch.invoke({"patch_text": patch_text, "dry_run": False}))
 
-    assert result.startswith(f"[Error] {APPLY_FAILED}:")
+    assert result.startswith("[OK] Applied patch")
+    assert f"[Warning] {CLEANUP_FAILED}:" in result
     assert "残留路径" in result
     assert (tmp_path / "cleanup.txt").read_bytes() == b"created\n"
 
