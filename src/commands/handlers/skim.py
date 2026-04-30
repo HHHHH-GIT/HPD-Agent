@@ -5,6 +5,7 @@ import traceback
 from pathlib import Path
 
 from src.agents import QueryAgent
+from src.llm.prompts import SKIM_PROMPT, SKIM_ERROR_PROMPT
 
 HPD_MD_HEADER = """# HPD — Project Knowledge Summary
 
@@ -13,47 +14,6 @@ HPD_MD_HEADER = """# HPD — Project Knowledge Summary
 
 ---
 
-"""
-
-SKIM_PROMPT = """你是一个专业的项目分析师。请根据以下项目扫描信息，生成一份 **HPD.MD 项目知识摘要**。
-
-## 要求
-
-1. 用中文输出。
-2. 结构清晰，使用 markdown 格式。
-3. 包含以下章节（根据实际情况调整，无内容则略过）：
-   - **项目概述**（一句话描述项目是什么）
-   - **技术栈**（语言、框架、关键依赖）
-   - **项目结构**（目录组织、主要模块/包）
-   - **配置与环境**（环境变量、配置文件、依赖管理）
-   - **容器化**（Docker 相关，如果有）
-   - **构建与运行**（如何启动项目、如何安装依赖）
-   - **其他备注**（CI/CD、代码规范、特殊约定等）
-4. 内容要简洁准确，适合作为 AI 助手的上下文参考。
-5. 不要臆测信息，只描述扫描结果中真实存在的内容。
-6. 如果某些章节信息不足，用「（未检测到）」标注。
-
-## 项目扫描信息
-
-{scan_result}
-
-请直接输出完整的 HPD.MD 内容（不含代码块包裹），开头包含以下元信息行：
-
-```
-# {project_name}
-> 项目知识摘要 · 自动生成 · {timestamp}
-```
-
-"""
-
-SKIM_ERROR_PROMPT = """你是一个专业的项目分析师。请根据以下项目扫描信息，生成一份 **HPD.MD 项目知识摘要**。
-
-注意：项目扫描遇到了部分错误（{error_count} 个），请在摘要中注明「部分信息未能扫描」。
-
-扫描结果：
-{scan_result}
-
-请按要求输出完整的 HPD.MD 内容（开头包含元信息行）。
 """
 
 

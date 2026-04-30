@@ -18,12 +18,20 @@ from src.commands.handlers import (
     run_help,
     run_love,
     run_model,
-    run_new,
     run_sessions,
     run_skim,
     run_summary,
     run_tokens,
 )
+
+from src.commands.completer import CommandCompleter, get_completer
+
+__all__ = [
+    "COMMAND_HANDLERS",
+    "handle_command",
+    "CommandCompleter",
+    "get_completer",
+]
 
 COMMAND_HANDLERS: dict[str, callable] = {
     "/context":    run_context,
@@ -31,7 +39,6 @@ COMMAND_HANDLERS: dict[str, callable] = {
     "/help":       run_help,
     "/I!Love'You!": run_love,
     "/model":      run_model,
-    "/new":        run_new,
     "/sessions":   run_sessions,
     "/skim":       run_skim,
     "/summary":    run_summary,

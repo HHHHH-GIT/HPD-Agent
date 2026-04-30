@@ -26,40 +26,21 @@ load_dotenv()
 
 from src.agents import QueryAgent
 from src.llm import get_llm
-from src.commands import COMMAND_HANDLERS, handle_command
+from src.commands import COMMAND_HANDLERS, handle_command, get_completer
 from src.commands.handlers.tokens import get_used_tokens, MAX_TOKENS
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 
 
 # ----------------------------------------------------------------------
-# Completion
+# Session
 # ----------------------------------------------------------------------
-class _SlashCommandCompleter(Completer):
-    """Completer that offers /-prefixed commands."""
-
-    def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        if not text.startswith("/"):
-            return
-        for cmd in COMMAND_HANDLERS:
-            if cmd.startswith(text):
-                yield Completion(
-                    cmd,
-                    start_position=-len(text),
-                    display=cmd.lstrip("/"),
-                )
-
-
-_cli_completer = _SlashCommandCompleter()
 
 
 def _build_session() -> PromptSession:
     """Build a PromptSession: Enter submits, Ctrl+J inserts newline."""
-
     kb = KeyBindings()
 
     @kb.add(Keys.ControlC, eager=True)
@@ -68,15 +49,15 @@ def _build_session() -> PromptSession:
 
     @kb.add(Keys.ControlJ)
     def _newline(event):
-        """Ctrl+J inserts a newline without submitting."""
         event.app.current_buffer.insert_text("\n")
 
     return PromptSession(
         multiline=False,
         key_bindings=kb,
         enable_history_search=False,
+        complete_while_typing=True,
         prompt_continuation=" | ",
-        completer=_cli_completer,
+        completer=get_completer(),
     )
 
 
@@ -114,6 +95,7 @@ async def run_loop():
     print("  Type /exit to quit.\n")
 
     agent = QueryAgent()
+    get_completer().set_agent(agent)
 
     while True:
         try:

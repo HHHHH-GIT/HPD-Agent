@@ -1,4 +1,10 @@
-"""Handler for the /model command — list, create, and switch LLM profiles."""
+"""Handler for the /model command — list, create, and switch LLM profiles.
+
+Sub-commands:
+    /model list                → list all profiles
+    /model create              → interactive create
+    /model switch <name>      → switch to named profile
+"""
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
@@ -109,42 +115,53 @@ def _run_create(store: ModelStore) -> None:
 
 
 # -------------------------------------------------------------------------- #
-# Entry point                                                                  #
+# Sub-command handler                                                          #
 # -------------------------------------------------------------------------- #
 
-def run(raw: str, agent: QueryAgent) -> bool:
-    """
-    Handle /model command.
+VALID_SUBS = ("list", "create", "switch")
 
-        /model           → list all profiles
-        /model create   → interactive create
-        /model <name>   → switch to named profile
-    """
-    store = get_store()
+def handle(raw: str, agent: QueryAgent | None = None) -> bool:
+    """Dispatch to the appropriate sub-command."""
     parts = raw.strip().split()
 
-    # /model
-    if len(parts) == 1:
+    if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() == "list"):
+        store = get_store()
         _print_list(store)
         return False
 
     sub = parts[1].lower()
 
-    # /model create
+    if sub not in VALID_SUBS:
+        print(f"Unknown sub-command: '{sub}'")
+        print(f"Valid sub-commands: {', '.join(VALID_SUBS)}\n")
+        return False
+
+    store = get_store()
+
     if sub == "create":
         _run_create(store)
         return False
 
-    # /model <name>
-    name = sub
-    try:
-        store.switch(name)
-        profile = store.get(name)
-        print(f"Switched to model '{name}'.")
-        if profile:
-            _print_profile(name, profile, is_active=True, name_width=len(name))
-        print()
-    except ValueError as e:
-        print(f"Error: {e}")
-        print("Use /model to see available models.\n")
+    if sub == "switch":
+        if len(parts) < 3:
+            print("Usage: /model switch <name>\n")
+            return False
+        name = parts[2]
+        try:
+            store.switch(name)
+            profile = store.get(name)
+            print(f"Switched to model '{name}'.")
+            if profile:
+                _print_profile(name, profile, is_active=True, name_width=len(name))
+            print()
+        except ValueError as e:
+            print(f"Error: {e}")
+            print("Use /model list to see available models.\n")
+        return False
+
     return False
+
+
+# Legacy entry point (still called by the registry as run(raw, agent))
+def run(raw: str, agent: QueryAgent) -> bool:
+    return handle(raw, agent)
