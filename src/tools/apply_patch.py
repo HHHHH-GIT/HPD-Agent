@@ -473,9 +473,21 @@ def _error_hint(code: str) -> str:
 
 # ──────────────── 解析器 ────────────────
 def parse_patch_text(patch_text: str) -> PatchDocument:
-    """把 v2 patch 文本解析为 PatchDocument。
+    """把 v2 patch 文本解析为 PatchDocument(块感知,支持标签)。
 
-    严格模式:不接受 git diff 片段、不接受任何 v1 hunk 语法。
+    解析器一次性按行从上到下走读,关键不变量:**进入 CONTENT 或 SEARCH/
+    REPLACE 块后,只看自己的 close 标记**。这意味着块内可以含字面的
+    ``*** End Patch`` / ``*** Add File:`` / 其它 ``<<<<<<<`` 等,都视为内容。
+
+    标签化块(可选):为了让块内容含字面 ``>>>>>>> END`` / ``>>>>>>> REPLACE``
+    时也能解析,允许在打开标记后写一个非空白 tag,close 必须带相同 tag::
+
+        <<<<<<< CONTENT mydoc
+        content with >>>>>>> END inside
+        >>>>>>> END mydoc
+
+    严格模式:不接受 git diff 片段(``diff --git`` / ``---`` / ``+++`` /
+    ``@@``)。
     """
     _ = validate_patch_text_size(patch_text)
     lines = patch_text.splitlines()
@@ -486,30 +498,27 @@ def parse_patch_text(patch_text: str) -> PatchDocument:
             line=1,
             expected=BEGIN_MARKER,
             actual=lines[0] if lines else "<empty patch>",
+            hint="请输出完整 v2 patch 信封,不要输出 git diff。",
         )
 
-    end_index = _find_end_marker(lines)
-    for offset, trailing_line in enumerate(lines[end_index + 1 :], start=end_index + 2):
-        if trailing_line.strip():
-            raise PatchError(
-                INVALID_ENVELOPE,
-                "only whitespace is allowed after the end marker",
-                line=offset,
-            )
-
-    body = lines[1:end_index]
     operations: list[PatchOperation] = []
     seen_paths: set[str] = set()
-    index = 0
+    cursor = 1
+    end_marker_index: int | None = None
 
-    while index < len(body):
-        line = body[index]
-        line_number = index + 2
+    while cursor < len(lines):
+        line = lines[cursor]
+        line_number = cursor + 1
+
         if _is_blank_separator(line):
-            index += 1
+            cursor += 1
             continue
 
-        # 友好提示:用户误用了 git diff
+        if line == END_MARKER:
+            end_marker_index = cursor
+            cursor += 1
+            break
+
         if _GIT_DIFF_HINT_RE.match(line):
             raise PatchError(
                 MALFORMED_SECTION,
@@ -520,18 +529,25 @@ def parse_patch_text(patch_text: str) -> PatchDocument:
 
         section_match = _SECTION_RE.match(line)
         if section_match is None:
+            # 提前关闭诊断:回扫近 30 行,看是否有刚关闭过的 CONTENT/REPLACE 块。
+            # 如果当前 line 离最近的 close 标记不远(典型 markdown
+            # 文档场景),很可能是块内含字面 close 标记,导致块被提前关闭。
+            diagnostic_hint = _diagnose_premature_close(lines, cursor)
             raise PatchError(
                 MALFORMED_SECTION,
                 "expected a file operation section (Add/Update/Delete/Replace File)",
                 line=line_number,
                 actual=line,
+                hint=diagnostic_hint,
             )
 
         section_name = section_match.group(1)
         raw_path = section_match.group(2)
         if not raw_path.strip():
             raise PatchError(
-                MALFORMED_SECTION, "section path must not be empty", line=line_number
+                MALFORMED_SECTION,
+                "section path must not be empty",
+                line=line_number,
             )
         if raw_path in seen_paths:
             raise PatchError(
@@ -541,20 +557,42 @@ def parse_patch_text(patch_text: str) -> PatchDocument:
             )
         seen_paths.add(raw_path)
 
-        index += 1
+        cursor += 1
         if section_name == "Add File":
-            operation, index = _parse_content_section(
-                "add", raw_path, body, index, line_number
+            operation, cursor = _parse_content_section(
+                "add", raw_path, lines, cursor, line_number
             )
         elif section_name == "Replace File":
-            operation, index = _parse_content_section(
-                "replace", raw_path, body, index, line_number
+            operation, cursor = _parse_content_section(
+                "replace", raw_path, lines, cursor, line_number
             )
         elif section_name == "Update File":
-            operation, index = _parse_update_section(raw_path, body, index, line_number)
+            operation, cursor = _parse_update_section(
+                raw_path, lines, cursor, line_number
+            )
         else:  # Delete File
-            operation, index = _parse_delete_section(raw_path, body, index, line_number)
+            operation, cursor = _parse_delete_section(
+                raw_path, lines, cursor, line_number
+            )
         operations.append(operation)
+
+    if end_marker_index is None:
+        raise PatchError(
+            INVALID_ENVELOPE,
+            "patch is missing the end marker",
+            expected=END_MARKER,
+            hint="请确保补丁最后一行是 *** End Patch。",
+        )
+
+    while cursor < len(lines):
+        if lines[cursor].strip():
+            raise PatchError(
+                INVALID_ENVELOPE,
+                "only whitespace is allowed after the end marker",
+                line=cursor + 1,
+                actual=lines[cursor],
+            )
+        cursor += 1
 
     if not operations:
         raise PatchError(
@@ -571,105 +609,169 @@ def validate_patch_text_size(patch_text: str) -> int:
     return patch_size
 
 
-def _find_end_marker(lines: list[str]) -> int:
-    for index, line in enumerate(lines[1:], start=1):
-        if line == END_MARKER:
-            return index
-    raise PatchError(
-        INVALID_ENVELOPE,
-        "patch is missing the end marker",
-        expected=END_MARKER,
-        hint="请确保补丁最后一行是 *** End Patch。",
-    )
-
-
 def _is_blank_separator(line: str) -> bool:
     return not line.strip()
 
 
-def _find_next_section(lines: list[str], start_index: int) -> int:
-    """跳到下一个 *** 起始行的索引,或到达末尾。"""
-    index = start_index
-    while index < len(lines):
-        if lines[index].startswith("*** "):
-            return index
-        index += 1
-    return index
+def _parse_block_tag(line: str, expected_open: str) -> str | None:
+    """返回 tag 字符串(空字符串表示未带 tag);不匹配则返回 None。
+
+    合法形式:
+      ``<<<<<<< CONTENT``         → tag = ""
+      ``<<<<<<< CONTENT mydoc``   → tag = "mydoc"
+
+    tag 必须是单个非空白 token,不含控制字符。
+    """
+    if line == expected_open:
+        return ""
+    prefix = expected_open + " "
+    if line.startswith(prefix):
+        tag = line[len(prefix) :].strip()
+        if not tag:
+            return None
+        if _CONTROL_CHAR_RE.search(tag):
+            return None
+        return tag
+    return None
+
+
+def _close_marker(base: str, tag: str) -> str:
+    return f"{base} {tag}" if tag else base
+
+
+def _diagnose_premature_close(lines: list[str], cursor: int) -> str | None:
+    """当 envelope 主循环遇到非法 section 行时,检查是否是块被字面 close 提前关闭。
+
+    回扫最近 30 行,如果发现近期(<= 5 行内)出现过 CONTENT/REPLACE close 标记,
+    且当前行不像合法 section header,说明 LLM 很可能在块内字面写了 close。
+    """
+    look_back = max(0, cursor - 30)
+    for probe in range(cursor - 1, look_back - 1, -1):
+        candidate = lines[probe]
+        if (
+            candidate == CONTENT_CLOSE
+            or candidate == REPLACE_CLOSE
+            or candidate.startswith(CONTENT_CLOSE + " ")
+            or candidate.startswith(REPLACE_CLOSE + " ")
+        ):
+            distance = cursor - probe
+            if distance <= 5:
+                return (
+                    f"上一个块在第 {probe + 1} 行被关闭(距当前行 {distance} 行);"
+                    "如果这是文档/教程内容,块里很可能含字面 '>>>>>>> END' 或 "
+                    "'>>>>>>> REPLACE'。请给该块加 tag,例如 '<<<<<<< CONTENT doc' / "
+                    "'>>>>>>> END doc',这样块内字面 close 标记不会被误识别。"
+                )
+            break
+    return (
+        "请检查 *** Add/Update/Delete/Replace File: 行;Add 与 Replace 需要 "
+        "CONTENT 块,Update 需要至少一个 SEARCH/REPLACE 块,Delete 不需要正文。"
+        "如果文件内容里需要含字面 '>>>>>>> END' / '>>>>>>> REPLACE' / '=======',"
+        "请给块加 tag,例如 '<<<<<<< CONTENT doc' / '>>>>>>> END doc'。"
+    )
 
 
 def _parse_content_section(
     kind: OperationKind,
     path: str,
     lines: list[str],
-    start_index: int,
+    start: int,
     section_line_number: int,
 ) -> tuple[PatchOperation, int]:
     """解析 Add File / Replace File 的 CONTENT 块。"""
-    end_index = _find_next_section(lines, start_index)
-    cursor = start_index
-    while cursor < end_index and _is_blank_separator(lines[cursor]):
+    cursor = start
+    while cursor < len(lines) and _is_blank_separator(lines[cursor]):
         cursor += 1
 
-    if cursor >= end_index or lines[cursor] != CONTENT_OPEN:
+    section_label = "Add" if kind == "add" else "Replace"
+
+    if cursor >= len(lines):
         raise PatchError(
             MALFORMED_SECTION,
-            f"{'Add' if kind == 'add' else 'Replace'} File requires a CONTENT block",
+            f"{section_label} File requires a CONTENT block",
             line=section_line_number,
             expected=f"{CONTENT_OPEN} ... {CONTENT_CLOSE}",
-            actual=lines[cursor] if cursor < end_index else "<missing>",
+            actual="<missing>",
         )
 
+    open_line = lines[cursor]
+    tag = _parse_block_tag(open_line, CONTENT_OPEN)
+    if tag is None:
+        # 把"另一个 section header / End Patch 直接跟在 Add File 后"的情况
+        # 识别为缺少 CONTENT 块,而不是无关 section 错误
+        if open_line == END_MARKER or _SECTION_RE.match(open_line):
+            raise PatchError(
+                MALFORMED_SECTION,
+                f"{section_label} File requires a CONTENT block",
+                line=section_line_number,
+                expected=f"{CONTENT_OPEN} ... {CONTENT_CLOSE}",
+                actual=open_line,
+            )
+        raise PatchError(
+            MALFORMED_SECTION,
+            f"{section_label} File requires a CONTENT block",
+            line=cursor + 1,
+            expected=f"{CONTENT_OPEN} ... {CONTENT_CLOSE}",
+            actual=open_line,
+        )
+
+    close_target = _close_marker(CONTENT_CLOSE, tag)
     content_start = cursor + 1
-    close_index = None
-    for probe in range(content_start, end_index):
-        if lines[probe] == CONTENT_CLOSE:
+    close_index: int | None = None
+    for probe in range(content_start, len(lines)):
+        if lines[probe] == close_target:
             close_index = probe
             break
     if close_index is None:
         raise PatchError(
             MALFORMED_BLOCK,
-            f"CONTENT block missing closing marker {CONTENT_CLOSE}",
-            line=cursor + 2,
+            f"CONTENT block missing closing marker {close_target}",
+            line=cursor + 1,
+            hint=(
+                "若内容中含字面 '>>>>>>> END',请在打开标记后加一个唯一 tag,"
+                "例如 '<<<<<<< CONTENT doc' / '>>>>>>> END doc'。"
+            ),
         )
 
-    content_lines = lines[content_start:close_index]
-    content = "\n".join(content_lines)
-
-    # CONTENT 块后只允许空白
-    for tail in range(close_index + 1, end_index):
-        if not _is_blank_separator(lines[tail]):
-            raise PatchError(
-                MALFORMED_SECTION,
-                f"unexpected content after CONTENT block",
-                line=tail + 2,
-                actual=lines[tail],
-            )
-
-    return PatchOperation(kind=kind, path=path, content=content), end_index
+    content = "\n".join(lines[content_start:close_index])
+    return PatchOperation(kind=kind, path=path, content=content), close_index + 1
 
 
 def _parse_update_section(
     path: str,
     lines: list[str],
-    start_index: int,
+    start: int,
     section_line_number: int,
 ) -> tuple[PatchOperation, int]:
-    end_index = _find_next_section(lines, start_index)
+    """解析 Update File 的一个或多个 SEARCH/REPLACE 块,直到下一个 section 或 End Patch。"""
     blocks: list[SearchReplaceBlock] = []
-    cursor = start_index
+    cursor = start
 
-    while cursor < end_index:
-        if _is_blank_separator(lines[cursor]):
+    while cursor < len(lines):
+        while cursor < len(lines) and _is_blank_separator(lines[cursor]):
             cursor += 1
-            continue
-        if lines[cursor] != SEARCH_OPEN:
+        if cursor >= len(lines):
+            break
+
+        line = lines[cursor]
+        if line == END_MARKER or _SECTION_RE.match(line):
+            break
+
+        tag = _parse_block_tag(line, SEARCH_OPEN)
+        if tag is None:
+            diagnostic_hint = _diagnose_premature_close(lines, cursor) or (
+                "Update File 必须由一个或多个 SEARCH/REPLACE 块组成。"
+                "格式:<<<<<<< SEARCH / 内容 / ======= / 内容 / >>>>>>> REPLACE。"
+            )
             raise PatchError(
                 MALFORMED_BLOCK,
                 f"expected {SEARCH_OPEN}",
-                line=cursor + 2,
-                actual=lines[cursor],
+                line=cursor + 1,
+                actual=line,
+                hint=diagnostic_hint,
             )
-        block, cursor = _parse_search_replace_block(lines, cursor, end_index)
+
+        block, cursor = _parse_search_replace_block(lines, cursor, tag)
         blocks.append(block)
 
     if not blocks:
@@ -680,40 +782,56 @@ def _parse_update_section(
             expected=f"{SEARCH_OPEN} ... {SEARCH_DIVIDER} ... {REPLACE_CLOSE}",
         )
 
-    return PatchOperation(kind="update", path=path, blocks=tuple(blocks)), end_index
+    return PatchOperation(kind="update", path=path, blocks=tuple(blocks)), cursor
 
 
 def _parse_search_replace_block(
     lines: list[str],
     open_index: int,
-    section_end: int,
+    tag: str,
 ) -> tuple[SearchReplaceBlock, int]:
-    divider_index = None
-    close_index = None
-    for probe in range(open_index + 1, section_end):
+    divider_target = _close_marker(SEARCH_DIVIDER, tag)
+    close_target = _close_marker(REPLACE_CLOSE, tag)
+
+    divider_index: int | None = None
+    close_index: int | None = None
+
+    probe = open_index + 1
+    while probe < len(lines):
         line = lines[probe]
-        if line == SEARCH_DIVIDER and divider_index is None:
-            divider_index = probe
-        elif line == REPLACE_CLOSE:
+        if line == close_target:
             close_index = probe
             break
-        elif line == SEARCH_OPEN:
+        if line == divider_target and divider_index is None:
+            divider_index = probe
+        elif divider_index is None and _parse_block_tag(line, SEARCH_OPEN) is not None:
+            # 在还没看到 divider 之前就出现新的 SEARCH 打开标记 → 大概率是漏了 divider
             raise PatchError(
                 MALFORMED_BLOCK,
                 "nested SEARCH block before previous block was closed",
-                line=probe + 2,
+                line=probe + 1,
             )
+        probe += 1
+
     if divider_index is None:
         raise PatchError(
             MALFORMED_BLOCK,
-            f"SEARCH block missing divider {SEARCH_DIVIDER}",
-            line=open_index + 2,
+            f"SEARCH block missing divider {divider_target}",
+            line=open_index + 1,
+            hint=(
+                "若 SEARCH 内容含字面 '=======',请在打开标记后加一个唯一 tag,"
+                "例如 '<<<<<<< SEARCH x' / '======= x' / '>>>>>>> REPLACE x'。"
+            ),
         )
     if close_index is None:
         raise PatchError(
             MALFORMED_BLOCK,
-            f"SEARCH block missing closing marker {REPLACE_CLOSE}",
-            line=open_index + 2,
+            f"SEARCH block missing closing marker {close_target}",
+            line=open_index + 1,
+            hint=(
+                "若 REPLACE 内容含字面 '>>>>>>> REPLACE',请在打开标记后加一个唯一 tag,"
+                "例如 '<<<<<<< SEARCH x' 与 '>>>>>>> REPLACE x'。"
+            ),
         )
 
     search_lines = lines[open_index + 1 : divider_index]
@@ -730,19 +848,25 @@ def _parse_search_replace_block(
 def _parse_delete_section(
     path: str,
     lines: list[str],
-    start_index: int,
+    start: int,
     section_line_number: int,
 ) -> tuple[PatchOperation, int]:
-    end_index = _find_next_section(lines, start_index)
-    for probe in range(start_index, end_index):
-        if not _is_blank_separator(lines[probe]):
-            raise PatchError(
-                MALFORMED_SECTION,
-                "Delete File section does not accept a body",
-                line=probe + 2,
-                actual=lines[probe],
-            )
-    return PatchOperation(kind="delete", path=path), end_index
+    _ = section_line_number
+    cursor = start
+    while cursor < len(lines):
+        line = lines[cursor]
+        if _is_blank_separator(line):
+            cursor += 1
+            continue
+        if line == END_MARKER or _SECTION_RE.match(line):
+            break
+        raise PatchError(
+            MALFORMED_SECTION,
+            "Delete File section does not accept a body",
+            line=cursor + 1,
+            actual=line,
+        )
+    return PatchOperation(kind="delete", path=path), cursor
 
 
 # ──────────────── SEARCH/REPLACE 应用核心 ────────────────

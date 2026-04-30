@@ -489,6 +489,472 @@ class TestParserBlocks:
         assert document.operations[0].content == "+leading\n++double"
 
 
+class TestBlockAwareParsing:
+    """块内字面 *** End Patch / *** Add File: / <<<<<<< SEARCH 不被误识别。
+
+    这一类是 v2 修复的核心场景:LLM 写关于 apply_patch 的文档时,内容里
+    会含有补丁信封的字面字符串。块感知解析保证只有块自身的 close 标记
+    才能终止块。
+    """
+
+    def test_content_block_swallows_literal_end_marker(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """CONTENT 块内含字面 *** End Patch → 视为内容,不终止 envelope。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: doc.md",
+            "<<<<<<< CONTENT",
+            "Example:",
+            "    *** Begin Patch",
+            "    *** End Patch",
+            "End of doc.",
+            ">>>>>>> END",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "doc.md").read_text()
+        assert "*** Begin Patch" in body
+        assert "*** End Patch" in body
+        assert body.endswith("End of doc.\n")
+
+    def test_content_block_swallows_literal_section_headers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """CONTENT 块内含字面 *** Add/Update/Replace/Delete File:。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: doc.md",
+            "<<<<<<< CONTENT",
+            "Operations:",
+            "*** Add File: x",
+            "*** Update File: y",
+            "*** Replace File: z",
+            "*** Delete File: w",
+            ">>>>>>> END",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "doc.md").read_text()
+        assert "*** Add File: x" in body
+        assert "*** Delete File: w" in body
+
+    def test_content_block_swallows_literal_search_open(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """CONTENT 块内含字面 <<<<<<< SEARCH / =======。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: tutorial.md",
+            "<<<<<<< CONTENT",
+            "Use blocks like:",
+            "<<<<<<< SEARCH",
+            "old code",
+            "=======",
+            "new code",
+            ">>>>>>> END",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "tutorial.md").read_text()
+        assert "<<<<<<< SEARCH" in body
+        assert "=======" in body
+        assert "old code" in body
+
+    def test_search_block_swallows_literal_section_headers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """SEARCH/REPLACE 块内的字面 *** Add/Update File: / *** End Patch 不应被误识别。"""
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "x.md"
+        _ = target.write_text("note about *** Add File: x\n")
+        text = _envelope(
+            "*** Update File: x.md",
+            "<<<<<<< SEARCH",
+            "note about *** Add File: x",
+            "=======",
+            "updated note about *** End Patch",
+            ">>>>>>> REPLACE",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        assert (tmp_path / "x.md").read_text() == "updated note about *** End Patch\n"
+
+    def test_multi_section_with_literal_markers_in_first_content(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """前一个 CONTENT 含字面 *** End Patch,后一个 section 仍能被识别。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: a.md",
+            "<<<<<<< CONTENT",
+            "first file mentions *** End Patch literally",
+            ">>>>>>> END",
+            "*** Add File: b.md",
+            "<<<<<<< CONTENT",
+            "second file content",
+            ">>>>>>> END",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        assert "*** End Patch" in (tmp_path / "a.md").read_text()
+        assert "second file content" in (tmp_path / "b.md").read_text()
+
+    def test_full_user_failure_replay(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """重放用户对话中失败 14 次的 patch:写 apply_patch 文档。"""
+        monkeypatch.chdir(tmp_path)
+        text = (
+            "*** Begin Patch\n"
+            "*** Add File: test.md\n"
+            "<<<<<<< CONTENT\n"
+            "# apply_patch 工具使用手册\n"
+            "\n"
+            "## 完整示例\n"
+            "\n"
+            "```\n"
+            "*** Begin Patch\n"
+            "*** Update File: src/app.py\n"
+            "<<<<<<< SEARCH inner\n"
+            "def greet(name):\n"
+            "    return 'hi'\n"
+            "======= inner\n"
+            "def greet(name: str) -> str:\n"
+            "    return f'hi {name}'\n"
+            ">>>>>>> REPLACE inner\n"
+            "*** End Patch\n"
+            "```\n"
+            "\n"
+            "## 关键约束\n"
+            "\n"
+            "- SEARCH 必须按行精确匹配。\n"
+            ">>>>>>> END\n"
+            "*** End Patch\n"
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "test.md").read_text()
+        assert "# apply_patch 工具使用手册" in body
+        assert "*** Begin Patch" in body
+        assert "*** End Patch" in body
+        assert "<<<<<<< SEARCH inner" in body
+
+
+class TestTaggedBlocks:
+    """标签化块允许块内字面含 >>>>>>> END / >>>>>>> REPLACE / =======。"""
+
+    def test_tagged_content_with_literal_default_end(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """<<<<<<< CONTENT mydoc 让块内 >>>>>>> END(无 tag)成为字面文本。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: tutorial.md",
+            "<<<<<<< CONTENT mydoc",
+            "Default close marker is:",
+            ">>>>>>> END",
+            "And SEARCH close is:",
+            ">>>>>>> REPLACE",
+            ">>>>>>> END mydoc",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "tutorial.md").read_text()
+        assert ">>>>>>> END" in body
+        assert ">>>>>>> REPLACE" in body
+        # tag 本身不会进入文件内容
+        assert "mydoc" not in body
+
+    def test_tagged_replace_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "x.md"
+        _ = target.write_text("old\n")
+        text = _envelope(
+            "*** Replace File: x.md",
+            "<<<<<<< CONTENT v1",
+            "Default close inside:",
+            ">>>>>>> END",
+            ">>>>>>> END v1",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = target.read_text()
+        assert ">>>>>>> END" in body
+        assert "v1" not in body
+
+    def test_tagged_search_replace_with_literal_divider(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """REPLACE 内容含字面 ======= → 用 tag 解决。"""
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "x.md"
+        _ = target.write_text("intro\n\nold body\n")
+        text = _envelope(
+            "*** Update File: x.md",
+            "<<<<<<< SEARCH X",
+            "old body",
+            "======= X",
+            "new body",
+            "",
+            "Section",
+            "=======",
+            "more text",
+            ">>>>>>> REPLACE X",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = target.read_text()
+        assert "Section\n=======\n" in body
+        assert "new body" in body
+
+    def test_tag_mismatch_reports_expected_close(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """开闭 tag 不一致 → MALFORMED_BLOCK,错误信息包含期望的 close。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: a.txt",
+            "<<<<<<< CONTENT alpha",
+            "x",
+            ">>>>>>> END beta",
+        )
+        result = _invoke(text)
+        _assert_error_result(result, MALFORMED_BLOCK)
+        assert ">>>>>>> END alpha" in result
+
+    def test_tag_with_special_chars_supported(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """tag 可以含数字、连字符、点等非空白 token。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: a.txt",
+            "<<<<<<< CONTENT v1.2-final",
+            "content",
+            ">>>>>>> END v1.2-final",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        assert (tmp_path / "a.txt").read_text() == "content\n"
+
+    def test_default_block_inside_tagged_block_treated_literal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """tagged 块里出现默认 (无 tag) 的 close 不应误识别。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: doc.md",
+            "<<<<<<< CONTENT outer",
+            "Inside tagged block.",
+            ">>>>>>> END",
+            "Still inside.",
+            ">>>>>>> END outer",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "doc.md").read_text()
+        assert "Inside tagged block." in body
+        assert ">>>>>>> END\n" in body
+        assert "Still inside." in body
+
+    def test_tagged_block_in_update_section(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """每个 SEARCH/REPLACE 块独立带自己的 tag,块之间互不影响。"""
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "x.txt"
+        _ = target.write_text("first line\nA\nsecond line\nB\n")
+        text = _envelope(
+            "*** Update File: x.txt",
+            "<<<<<<< SEARCH a",
+            "A",
+            "======= a",
+            "AA",
+            ">>>>>>> REPLACE a",
+            "<<<<<<< SEARCH b",
+            "B",
+            "======= b",
+            "BB",
+            ">>>>>>> REPLACE b",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        assert target.read_text() == "first line\nAA\nsecond line\nBB\n"
+
+    def test_default_and_tagged_blocks_can_mix_in_update(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """同一个 Update 中可以混合带 tag 和不带 tag 的块。"""
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "x.txt"
+        _ = target.write_text("alpha\nbeta\n")
+        text = _envelope(
+            "*** Update File: x.txt",
+            "<<<<<<< SEARCH",
+            "alpha",
+            "=======",
+            "ALPHA",
+            ">>>>>>> REPLACE",
+            "<<<<<<< SEARCH x",
+            "beta",
+            "======= x",
+            "BETA",
+            ">>>>>>> REPLACE x",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        assert target.read_text() == "ALPHA\nBETA\n"
+
+
+class TestPrematureCloseDiagnostics:
+    """LLM 在 CONTENT 块内字面写 '>>>>>>> END' 时,错误信息必须主动引导加 tag。
+
+    这是 v2 修复的"事后救火"路径:即便 LLM 没读到 prompt 里的 tag 规则,
+    解析器在错误信息里也告诉它该怎么修。
+    """
+
+    def test_diagnostic_when_close_marker_appears_in_doc_content(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        text = (
+            "*** Begin Patch\n"
+            "*** Add File: doc.md\n"
+            "<<<<<<< CONTENT\n"
+            "# 文档\n"
+            "\n"
+            "CONTENT 块格式:\n"
+            "<<<<<<< CONTENT\n"
+            "内容\n"
+            ">>>>>>> END\n"
+            "\n"
+            "后续段落。\n"
+            ">>>>>>> END\n"
+            "*** End Patch\n"
+        )
+        result = _invoke(text, dry_run=True)
+        _assert_error_result(result, MALFORMED_SECTION)
+        assert "上一个块" in result
+        assert "提前关闭" in result or "字面 close" in result
+        assert "tag" in result.lower()
+        assert "<<<<<<< CONTENT" in result  # tag 用法示例
+
+    def test_diagnostic_when_replace_close_appears_in_search_replace_content(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "x.md"
+        _ = target.write_text("teaching example\nold body\n")
+        text = (
+            "*** Begin Patch\n"
+            "*** Update File: x.md\n"
+            "<<<<<<< SEARCH\n"
+            "old body\n"
+            "=======\n"
+            "new body explaining how to write:\n"
+            ">>>>>>> REPLACE\n"  # 字面 close 标记被识别为真实 close
+            "more text\n"
+            ">>>>>>> REPLACE\n"
+            "*** End Patch\n"
+        )
+        result = _invoke(text, dry_run=True)
+        # 在 update 解析路径下报 MALFORMED_BLOCK,但 hint 也走同一个诊断
+        _assert_error_result(result, MALFORMED_BLOCK)
+        assert "上一个块" in result
+        assert "tag" in result.lower()
+
+    def test_diagnostic_only_triggers_for_recent_close(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """非法 section 行远离任何近期 close → 用默认通用 hint。"""
+        monkeypatch.chdir(tmp_path)
+        text = "*** Begin Patch\n" "some-bogus-line-not-a-section\n" "*** End Patch\n"
+        result = _invoke(text, dry_run=True)
+        _assert_error_result(result, MALFORMED_SECTION)
+        assert "上一个块" not in result
+
+    def test_with_tag_doc_writes_succeed_in_one_shot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """加了 tag 的文档场景一次成功——这是 LLM 看完 hint 应该写的形式。"""
+        monkeypatch.chdir(tmp_path)
+        text = (
+            "*** Begin Patch\n"
+            "*** Add File: doc.md\n"
+            "<<<<<<< CONTENT mydoc\n"
+            "# apply_patch 文档\n"
+            "\n"
+            "CONTENT 块格式:\n"
+            "<<<<<<< CONTENT\n"
+            "内容\n"
+            ">>>>>>> END\n"
+            "\n"
+            "SEARCH 块格式:\n"
+            "<<<<<<< SEARCH\n"
+            "old\n"
+            "=======\n"
+            "new\n"
+            ">>>>>>> REPLACE\n"
+            "\n"
+            "完整示例:\n"
+            "*** Begin Patch\n"
+            "*** Add File: x\n"
+            "<<<<<<< CONTENT\n"
+            "hello\n"
+            ">>>>>>> END\n"
+            "*** End Patch\n"
+            ">>>>>>> END mydoc\n"
+            "*** End Patch\n"
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "doc.md").read_text()
+        # 所有字面 close 标记都被保留
+        assert ">>>>>>> END" in body
+        assert ">>>>>>> REPLACE" in body
+        assert "*** End Patch" in body
+        assert "mydoc" not in body  # tag 不进文件
+
+
 # ============================================================================
 # 2. 路径校验
 # ============================================================================
@@ -2358,3 +2824,267 @@ class TestE2EScenarios:
         _assert_ok_result(result, dry_run=False)
         actual = target.read_text(encoding="utf-8")
         assert "「特殊」" in actual
+
+
+# ============================================================================
+# 19. v3:Here-doc label 支持(LLM 嵌入 apply_patch markers 字面量)
+# ============================================================================
+
+
+class TestHeredocLabelContent:
+    """CONTENT 块用 label 隔离,块内 marker 字面量按内容处理。"""
+
+    def test_unlabeled_close_inside_labeled_content_is_literal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """v3 关键修复:LLM 写关于 apply_patch 用法的文档时,
+        CONTENT 块内可以包含字面 ``>>>>>>> END``。
+        """
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: docs.md",
+            "<<<<<<< CONTENT EOF1",
+            "Use it like:",
+            "",
+            "    *** Begin Patch",
+            "    *** Add File: foo.txt",
+            "    <<<<<<< CONTENT",
+            "    file body",
+            "    >>>>>>> END",
+            "    *** End Patch",
+            ">>>>>>> END EOF1",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "docs.md").read_text()
+        assert ">>>>>>> END" in body
+        assert "<<<<<<< CONTENT" in body
+        assert "*** Begin Patch" in body  # 内层信封字面也保留
+
+    def test_other_labeled_close_is_literal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """块内 ``>>>>>>> END EOF2`` 不闭合用 ``EOF1`` 开的块。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: docs.md",
+            "<<<<<<< CONTENT EOF1",
+            "示例 A:",
+            "<<<<<<< CONTENT EOF2",
+            "嵌套示例的内容",
+            ">>>>>>> END EOF2",
+            "示例 A 结束。",
+            ">>>>>>> END EOF1",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "docs.md").read_text()
+        # 内层完整保留为字面文本
+        assert "<<<<<<< CONTENT EOF2" in body
+        assert ">>>>>>> END EOF2" in body
+        assert "示例 A 结束。" in body
+
+    def test_unlabeled_block_still_works(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """无 label 的块行为完全等同 v2 — 向后兼容。"""
+        monkeypatch.chdir(tmp_path)
+        result = _invoke(
+            _envelope("*** Add File: x.txt", "<<<<<<< CONTENT", "hi", ">>>>>>> END"),
+            dry_run=False,
+        )
+        _assert_ok_result(result, dry_run=False)
+        assert (tmp_path / "x.txt").read_text() == "hi\n"
+
+    def test_label_must_match_for_close(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """``<<<<<<< CONTENT FOO`` 不能由 ``>>>>>>> END BAR`` 关闭。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: x.txt",
+            "<<<<<<< CONTENT FOO",
+            "body",
+            ">>>>>>> END BAR",
+        )
+        result = _invoke(text)
+        _assert_error_result(result, MALFORMED_BLOCK)
+        # 错误信息应该明确写出期望的 label
+        assert "FOO" in result
+
+    def test_section_marker_inside_labeled_content_is_literal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """v3 修复:CONTENT 块内的 ``*** Add File:`` 字面行也按内容处理。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: docs.md",
+            "<<<<<<< CONTENT EOF",
+            "Section 类型:",
+            "*** Add File: path",
+            "*** Update File: path",
+            "*** Replace File: path",
+            "*** Delete File: path",
+            ">>>>>>> END EOF",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "docs.md").read_text()
+        assert "*** Add File: path" in body
+        assert "*** Delete File: path" in body
+
+    def test_end_patch_inside_labeled_content_is_literal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """v3 的另一关键修复:``*** End Patch`` 字面行在 CONTENT 块内被视为内容,
+        不会提前终结信封。``_find_end_marker`` 现在取最后一个 ``*** End Patch``。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: docs.md",
+            "<<<<<<< CONTENT EOF",
+            "Use it like:",
+            "*** Begin Patch",
+            "... operations ...",
+            "*** End Patch",
+            ">>>>>>> END EOF",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "docs.md").read_text()
+        assert "*** Begin Patch" in body
+        assert "*** End Patch" in body  # 注意没缩进也保留
+
+
+class TestHeredocLabelSearchReplace:
+    """SEARCH/REPLACE 块同样支持 label。"""
+
+    def test_labeled_search_with_marker_literals_in_search(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """目标文件本身就含 ``=======`` 行,需要用 label 才能精确匹配。"""
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "x.txt"
+        # 模拟一个文件里有 ===== 字面行
+        _ = target.write_text("alpha\n=======\nomega\n")
+        text = _envelope(
+            "*** Update File: x.txt",
+            "<<<<<<< SEARCH FOO",
+            "alpha",
+            "=======",
+            "omega",
+            "======= FOO",
+            "ALPHA",
+            "===",
+            "OMEGA",
+            ">>>>>>> REPLACE FOO",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        assert target.read_text() == "ALPHA\n===\nOMEGA\n"
+
+    def test_unlabeled_search_block_unchanged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "x.txt"
+        _ = target.write_text("hello\n")
+        result = _invoke(
+            _envelope(*_update_block("x.txt", ["hello"], ["world"])),
+            dry_run=False,
+        )
+        _assert_ok_result(result, dry_run=False)
+        assert target.read_text() == "world\n"
+
+    def test_labeled_search_label_mismatch_rejected(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        _ = (tmp_path / "x.txt").write_text("a\n")
+        text = _envelope(
+            "*** Update File: x.txt",
+            "<<<<<<< SEARCH FOO",
+            "a",
+            "======= FOO",
+            "A",
+            ">>>>>>> REPLACE BAR",  # label 不匹配
+        )
+        result = _invoke(text)
+        _assert_error_result(result, MALFORMED_BLOCK)
+
+
+class TestRealWorldUserScenario:
+    """直接复现用户失败的实际任务:写一份关于 apply_patch 的文档。"""
+
+    def test_write_apply_patch_documentation_to_test_md(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """这是用户对话中失败的真实补丁(简化版),v3 应一次成功。"""
+        monkeypatch.chdir(tmp_path)
+        text = _envelope(
+            "*** Add File: test.md",
+            "<<<<<<< CONTENT DOC",
+            "# apply_patch 工具使用手册",
+            "",
+            "## 概述",
+            "",
+            "apply_patch 使用自定义 v2 补丁格式。",
+            "",
+            "## 完整示例",
+            "",
+            "*** Begin Patch",
+            "*** Update File: src/app.py",
+            "<<<<<<< SEARCH",
+            "def greet(name):",
+            "    return 'hi'",
+            "=======",
+            "def greet(name: str) -> str:",
+            "    return f'hi {name}'",
+            ">>>>>>> REPLACE",
+            "*** Add File: src/util.py",
+            "<<<<<<< CONTENT",
+            "def noop():",
+            "    pass",
+            ">>>>>>> END",
+            "*** Delete File: legacy.py",
+            "*** End Patch",
+            "",
+            "## 关键约束",
+            "",
+            "- SEARCH 必须按行精确匹配。",
+            "- SEARCH 在文件中必须只出现一次。",
+            "- 不要使用行号,也不要算计数。",
+            ">>>>>>> END DOC",
+        )
+        result = _invoke(text, dry_run=False)
+        _assert_ok_result(result, dry_run=False)
+        body = (tmp_path / "test.md").read_text()
+        # 完整保留所有字面 markers
+        assert "*** Begin Patch" in body
+        assert "*** End Patch" in body
+        assert "<<<<<<< SEARCH" in body
+        assert "=======" in body
+        assert ">>>>>>> REPLACE" in body
+        assert "<<<<<<< CONTENT" in body
+        assert ">>>>>>> END" in body
+        assert "*** Update File:" in body
+        assert "*** Delete File:" in body
