@@ -245,7 +245,7 @@ async def run_all(
                     c = completed_cache[dep_id]
                     dep_results.append(
                         f"[子任务 {dep_id} ({task_map[dep_id].name}) 结果]\n"
-                        f"{c.get('detail', '')[:1000]}"
+                        f"{c.get('detail', '')[:1500]}"
                     )
                     for transitively_dep in task_map[dep_id].depends:
                         if transitively_dep not in seen and transitively_dep not in queue:

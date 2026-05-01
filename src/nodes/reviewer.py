@@ -4,19 +4,41 @@ This is a pure business-logic node — no round control, no decision mapping.
 The reviewer agent (src/agents/reviewer_agent.py) handles those concerns.
 """
 
+import re
+
 from src.core.models import ReviewerDecision
 from src.core.observability import get_tracer, TokenTrackerCallback
 from src.llm import get_structured_llm, REVIEW_PROMPT
+
+_MAX_DETAIL_CHARS = 2000
+
+
+def _truncate_at_sentence(text: str, max_chars: int) -> str:
+    """Truncate text at a sentence boundary near max_chars."""
+    if len(text) <= max_chars:
+        return text
+    # Try to cut at a sentence-ending punctuation near the limit
+    cut = text[:max_chars]
+    # Look for the last sentence boundary in the cut range
+    match = re.search(r"[。！？.!?]\s*", cut[::-1])
+    if match:
+        # match.start() is the position from the end
+        boundary = max_chars - match.start()
+        if boundary > max_chars * 0.6:  # Don't cut too early
+            return cut[:boundary] + "\n…（已截断）"
+    # Fallback: hard cut with marker
+    return cut + "…（已截断）"
 
 
 def _format_sub_task_results(outputs) -> str:
     lines = []
     for o in outputs:
         status = "失败" if o.summary.startswith("[失败]") else "成功"
+        detail_preview = _truncate_at_sentence(o.detail, _MAX_DETAIL_CHARS)
         lines.append(
             f"子任务 {o.id} ({o.name}) — {status}\n"
             f"  摘要: {o.summary}\n"
-            f"  详情: {o.detail[:500]}"
+            f"  详情: {detail_preview}"
         )
     return "\n\n".join(lines)
 
