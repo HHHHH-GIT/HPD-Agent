@@ -103,6 +103,49 @@ class SubTaskAssessmentResult(BaseModel):
     )
 
 
+class RewriteResult(BaseModel):
+    """Structured output from the prompt rewriter."""
+
+    angles: list[str] = Field(
+        description="N different angles/approaches for tackling the task. "
+        "Each angle is a concise one-line description of a strategy."
+    )
+    reasoning: str = Field(
+        default="",
+        description="Brief explanation of why these angles were chosen.",
+    )
+
+
+class CandidateResult(BaseModel):
+    """Result from executing a single prompt variation (multi-path)."""
+
+    variation_index: int = Field(description="Index of the variation (0-based).")
+    prompt_angle: str = Field(description="The angle/approach used for this candidate.")
+    detail: str = Field(description="Full reasoning output from this candidate.")
+    summary: str = Field(description="One-sentence summary of this candidate.")
+
+
+class EvaluatorScore(BaseModel):
+    """1:1 evaluation score for a single result."""
+
+    score: float = Field(description="Quality score (0.0-1.0).")
+    reasoning: str = Field(description="Explanation of the score.")
+    issues: list[str] = Field(
+        default_factory=list,
+        description="Specific issues found in the result.",
+    )
+
+
+class ReflectionResult(BaseModel):
+    """Structured output from the reflector."""
+
+    improved_prompt: str = Field(
+        description="Improved prompt/strategy for the next execution attempt."
+    )
+    strategy: str = Field(description="Summary of the improvement strategy.")
+    reasoning: str = Field(description="Why this improvement should help.")
+
+
 class PlannerResult(BaseModel):
     """Structured output from the planner LLM call — a DAG of sub-tasks."""
 
