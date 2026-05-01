@@ -25,16 +25,27 @@ Level-1 Assessment (simple / complex)
                     Scheduler (parallel execution via Kahn's algorithm)
                           │
                           ▼
-                    Synthesizer (streaming final answer)
+                    Reviewer (quality assessment)
+                          │
+                    ┌─────┼─────────────┐
+                    │     │             │
+                 proceed  re-execute  add_tasks
+                    │     │             │
+                    ▼     ▼             ▼
+              Synthesizer Scheduler  Coordinator
+                    │    (loop)      (re-plan)
+                    ▼
+              Streaming Final Answer
 ```
 
 ### Multi-Agent System
 
-| Agent                | Role                                                                       |
-| -------------------- | -------------------------------------------------------------------------- |
-| **QueryAgent**       | Public facade. Manages sessions, boots with system info, exposes the REPL. |
-| **CoordinatorAgent** | Decomposes complex queries into a DAG of sub-tasks with cycle detection.   |
-| **ExpertAgent**      | Executes individual sub-tasks, routing each through Level-2 assessment.    |
+| Agent                | Role                                                                                 |
+| -------------------- | ------------------------------------------------------------------------------------ |
+| **QueryAgent**       | Public facade. Manages sessions, boots with system info, exposes the REPL.           |
+| **CoordinatorAgent** | Decomposes complex queries into a DAG of sub-tasks with cycle detection.             |
+| **ExpertAgent**      | Executes individual sub-tasks, routing each through Level-2 assessment.              |
+| **Reviewer**         | Evaluates sub-task quality. Can request re-execution or suggest new sub-tasks (max 2 rounds). |
 
 ### Agent Tools
 
@@ -51,6 +62,7 @@ Level-1 Assessment (simple / complex)
 | ----------- | -------------------- | ---------------------------------------------------- |
 | **Level 1** | `simple` / `complex` | Simple → direct answer; Complex → Coordinator        |
 | **Level 2** | `easy` / `hard`      | Easy → single tool call; Hard → multi-step reasoning |
+| **Review**  | `proceed` / `re-execute` / `add_tasks` | Quality gate after execution. Re-execute weak tasks or add new sub-tasks (max 2 rounds). |
 
 ---
 
@@ -62,6 +74,7 @@ All commands are entered at the REPL prompt.
 | ----------------------- | ------------------------------------------------------------- |
 | `/help`                 | Show all available commands                                   |
 | `/context [-c N] [-d]`  | View the conversation context window                          |
+| `/context clear`        | Force clear the current session context                       |
 | `/exit`                 | Exit the agent                                                |
 | `/model list`           | List all saved LLM model configurations                       |
 | `/model create`         | Interactively create a new model profile                      |
@@ -73,6 +86,7 @@ All commands are entered at the REPL prompt.
 | `/skim [path]`          | Scan the project and generate `HPD.MD` knowledge summary      |
 | `/summary`              | Summarize context and reset the context window (saves tokens) |
 | `/tokens`               | Show current token usage                                      |
+| `/trace [on\|half\|off]`| Toggle tracing: on (console+file), half (console only), off. Persisted across restarts. |
 
 ---
 
