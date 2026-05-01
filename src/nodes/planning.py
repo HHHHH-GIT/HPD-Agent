@@ -30,6 +30,11 @@ async def decompose(query: str) -> tuple[list, PlannerResult]:
             result: PlannerResult = await classifier.ainvoke(
                 PLANNER_PROMPT.format(query=query)
             )
+            if result is None:
+                print(f"[Planning] 尝试 {attempt}/3 LLM 返回空结果，重试...")
+                if attempt == 3:
+                    raise RuntimeError("LLM 在 3 次尝试后均未返回有效分解结果。")
+                continue
             tasks = result.sub_tasks
 
             if check_circle(tasks):
@@ -83,6 +88,8 @@ async def replan(
 
         llm = get_structured_llm(PlannerResult)
         result: PlannerResult = await llm.ainvoke(prompt)
+        if result is None:
+            raise RuntimeError("Replan LLM 返回空结果。")
         new_tasks = result.sub_tasks
 
         # Cycle check on full graph
