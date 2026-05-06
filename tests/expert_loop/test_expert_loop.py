@@ -208,7 +208,36 @@ class TestExecutionBranching(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.tools_used, [])
         self.assertEqual(result.tool_log, "")
 
-    @patch("src.nodes.execution._expert_loop")
+    @patch("src.nodes.execution._execute_single_with_tools")
+    @patch("src.nodes.execution._extract_key_findings_llm", return_value=[])
+    @patch("src.nodes.execution.TokenTrackerCallback.snapshot", return_value=(0, 0, ""))
+    @patch("src.nodes.execution.get_tracer")
+    @patch("src.nodes.execution.get_structured_llm")
+    async def test_easy_task_with_tools_uses_tool_execution(
+        self, mock_get_structured, mock_tracer, mock_token, mock_kf, mock_with_tools
+    ):
+        """Easy tasks that require real files/tools should not use the no-tool path."""
+        mock_tracer.return_value = _mock_tracer()
+        mock_get_structured.return_value = AsyncMock(
+            ainvoke=AsyncMock(return_value=SubTaskAssessmentResult(
+                difficulty=SubTaskDifficulty.EASY,
+                requires_tools=True,
+                reasoning="needs files",
+            ))
+        )
+        from src.nodes.execution import ExecutionArtifact, execute
+        mock_with_tools.return_value = ExecutionArtifact(
+            detail='{"detail": "tool answer", "summary": "done"}',
+            tool_log="[Tool: read_file(path='src/main.py')]\n...",
+        )
+
+        result = await execute(1, "inspect src/main.py", "ctx")
+
+        mock_with_tools.assert_called_once()
+        self.assertFalse(result.expert_mode)
+        self.assertIn("src/main.py", result.tool_log)
+
+    @patch("src.nodes.execution._tot_expert_loop")
     @patch("src.nodes.execution.TokenTrackerCallback.snapshot", return_value=(0, 0, ""))
     @patch("src.nodes.execution.get_tracer")
     @patch("src.nodes.execution.get_structured_llm")
@@ -222,12 +251,41 @@ class TestExecutionBranching(unittest.IsolatedAsyncioTestCase):
                 difficulty=SubTaskDifficulty.HARD, reasoning="complex"
             ))
         )
-        mock_expert.return_value = "expert result"
+        from src.nodes.execution import ExecutionArtifact
+        mock_expert.return_value = ExecutionArtifact(detail="expert result")
 
         from src.nodes.execution import execute
         result = await execute(1, "hard task", "ctx")
 
         mock_expert.assert_called_once()
+
+    @patch("src.nodes.execution._tool_backed_expert_loop")
+    @patch("src.nodes.execution.TokenTrackerCallback.snapshot", return_value=(0, 0, ""))
+    @patch("src.nodes.execution.get_tracer")
+    @patch("src.nodes.execution.get_structured_llm")
+    async def test_hard_task_with_tools_bypasses_tot(
+        self, mock_get_structured, mock_tracer, mock_token, mock_tool_expert
+    ):
+        """Hard tasks needing repository access should skip TOT and use tools directly."""
+        mock_tracer.return_value = _mock_tracer()
+        mock_get_structured.return_value = AsyncMock(
+            ainvoke=AsyncMock(return_value=SubTaskAssessmentResult(
+                difficulty=SubTaskDifficulty.HARD,
+                requires_tools=True,
+                reasoning="complex and file-backed",
+            ))
+        )
+        from src.nodes.execution import ExecutionArtifact, execute
+        mock_tool_expert.return_value = ExecutionArtifact(
+            detail="tool expert result",
+            tool_log="[Tool: read_file(path='src/main.py')]\n...",
+        )
+
+        result = await execute(1, "compare src/main.py and src/run.py", "ctx")
+
+        mock_tool_expert.assert_called_once()
+        self.assertTrue(result.expert_mode)
+        self.assertIn("read_file", result.tool_log)
 
 
 # --------------------------------------------------------------------------

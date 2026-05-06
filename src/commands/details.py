@@ -15,4 +15,5 @@ COMMAND_DETAILS = {
     "/skim":      "Scan project and generate HPD.MD: /skim [path]",
     "/summary":   "Summarize current session and reset context",
     "/tokens":    "Show context window token usage",
+    "/trace":     "Control tracing output: /trace [on|half|off]",
 }

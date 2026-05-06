@@ -60,10 +60,68 @@ class QueryAgent:
             self._contexts[sid] = ConversationContext()
         return self._contexts[sid]
 
-    def _extract_tool_summary(self, synthesis_prompt: str) -> str:
-        """Parse tool names and paths from a synthesis prompt's tool log section.
+    def _summarize_tools_from_subtasks(self, outputs: list) -> str:
+        """Build a compact tool summary from SubTaskOutput objects or cached dicts."""
+        seen: set[str] = set()
+        parts: list[str] = []
 
-        The synthesis prompt contains tool results in the form:
+        def add(item: str) -> None:
+            value = item.strip()
+            if not value or value in seen:
+                return
+            seen.add(value)
+            parts.append(value)
+
+        for output in outputs:
+            tool_log = getattr(output, "tool_log", "") or output.get("tool_log", "") if isinstance(output, dict) else ""
+            if tool_log:
+                extracted = self._extract_tool_summary(tool_log)
+                for piece in extracted.split(","):
+                    if piece.strip():
+                        add(piece)
+
+            tools_used = getattr(output, "tools_used", None)
+            if tools_used is None and isinstance(output, dict):
+                tools_used = output.get("tools_used", [])
+
+            for path in tools_used or []:
+                if not isinstance(path, str):
+                    continue
+                path = path.strip()
+                if not path or path == "...":
+                    continue
+                if "/" in path or path.endswith((".py", ".md", ".json", ".toml", ".yaml", ".yml")):
+                    add(f"read_file: {path}")
+                else:
+                    add(f"tool_input: {path}")
+
+        return ", ".join(parts)
+
+    def _backfill_missing_tool_summary(self, ctx: ConversationContext) -> None:
+        """Best-effort migration for older sessions that saved no tool_summary.
+
+        If the session contains cached sub-task outputs but no assistant message
+        has tool metadata, attach a compact summary to the most recent assistant
+        turn so follow-up questions about previous tool usage can be answered.
+        """
+        if not ctx.sub_task_outputs:
+            return
+        if any(msg.tool_summary for msg in ctx.messages if msg.role == MessageRole.ASSISTANT):
+            return
+
+        summary = self._summarize_tools_from_subtasks(ctx.sub_task_outputs)
+        if not summary:
+            return
+
+        for msg in reversed(ctx.messages):
+            if msg.role == MessageRole.ASSISTANT and not msg.tool_summary:
+                msg.tool_summary = summary
+                break
+
+    def _extract_tool_summary(self, tool_log_text: str) -> str:
+        """Parse tool names and paths from a tool log section.
+
+        The log contains tool results in the form:
           [Tool: tool_name]\nresult
           [Tool: read_file(path='/...')]\ncontent
           [Tool: terminal(cmd='cat /...')]\noutput
@@ -74,21 +132,21 @@ class QueryAgent:
         parts: list[str] = []
 
         # Pattern: [Tool: name(args)]\n or [Tool: name]\n
-        for match in re.finditer(r"\[Tool:\s*(\w+)(?:\([^)]*\))?\]", synthesis_prompt):
+        for match in re.finditer(r"\[Tool:\s*(\w+)(?:\([^)]*\))?\]", tool_log_text):
             key = match.group(1)
             if key not in seen:
                 seen.add(key)
                 parts.append(key)
 
         # Also capture specific paths from read_file(path='...') and terminal(cmd='...')
-        for match in re.finditer(r"read_file\s*\([^'\"]*['\"]([^'\"]+)['\"]", synthesis_prompt):
+        for match in re.finditer(r"read_file\s*\([^'\"]*['\"]([^'\"]+)['\"]", tool_log_text):
             path = match.group(1).strip()
             key = f"read_file: {path}"
             if key not in seen:
                 seen.add(key)
                 parts.append(key)
 
-        for match in re.finditer(r"terminal\s*\(\s*cmd\s*=\s*'([^']+)'", synthesis_prompt):
+        for match in re.finditer(r"terminal\s*\(\s*cmd\s*=\s*'([^']+)'", tool_log_text):
             cmd = match.group(1).strip()
             key = f"terminal: {cmd}"
             if key not in seen:
@@ -106,6 +164,7 @@ class QueryAgent:
         """
         sid = thread_id or self._current_session
         ctx = self._get_context(sid)
+        self._backfill_missing_tool_summary(ctx)
         ctx.add_user_message(query)
 
         if sid not in self._session_boot_done:
@@ -161,6 +220,15 @@ class QueryAgent:
             ctx.sub_task_outputs = ctx.sub_task_outputs[-50:]
 
         tool_summary = self._extract_tool_summary(synthesis) if synthesis else ""
+        if not tool_summary and outputs:
+            tool_summary = self._summarize_tools_from_subtasks(outputs)
+        if not tool_summary:
+            for output in reversed(result.get("outputs", [])):
+                if output.node == "direct_answer":
+                    tool_log = output.result.get("tool_calls", "")
+                    if tool_log:
+                        tool_summary = self._extract_tool_summary(tool_log)
+                    break
         if final_text:
             # Store compact content — the full synthesis prompt is ephemeral.
             # to_summary() already prefers answer_content, so content is just a fallback.

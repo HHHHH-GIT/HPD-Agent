@@ -19,7 +19,7 @@ Level-1 Assessment (simple / complex)
     └── complex ──► Coordinator Agent (DAG decomposition)
                           │
                           ▼
-                    Level-2 Assessment (easy / hard)
+                    Level-2 Assessment (difficulty + requires_tools)
                           │
                           ▼
                     Scheduler (parallel execution via Kahn's algorithm)
@@ -49,20 +49,28 @@ Level-1 Assessment (simple / complex)
 
 ### Agent Tools
 
-| Tool                                         | Description                                                   |
-| -------------------------------------------- | ------------------------------------------------------------- |
-| `read_file(path, lines=100)`                 | Read file contents with optional line limit                   |
-| `write_file(filename, content, append=True)` | Write or append to files                                      |
-| `terminal(cmd)`                              | Execute shell commands; read-only commands are always allowed |
-| `project_scanner()`                          | Scan the current project structure and tech stack             |
+| Tool                         | Description                                                                           |
+| ---------------------------- | ------------------------------------------------------------------------------------- |
+| `read_file(path, lines=100)` | Read file contents with optional line limit                                           |
+| `apply_patch(...)`           | The only supported write path for repository edits; includes dry-run and conflict hints |
+| `terminal(cmd)`              | Execute shell commands; terminal commands require confirmation in the CLI             |
 
 ### Routing Levels
 
-| Level       | Classification       | Path                                                 |
-| ----------- | -------------------- | ---------------------------------------------------- |
-| **Level 1** | `simple` / `complex` | Simple → direct answer; Complex → Coordinator        |
-| **Level 2** | `easy` / `hard`      | Easy → single tool call; Hard → multi-step reasoning |
+| Level       | Classification       | Path                                                                                  |
+| ----------- | -------------------- | ------------------------------------------------------------------------------------- |
+| **Level 1** | `simple` / `complex` | Simple → direct answer; Complex → Coordinator                                         |
+| **Level 2** | `difficulty` + `requires_tools` | `easy + no-tools` → single call; `easy + tools` → tool-backed single pass; `hard + no-tools` → TOT; `hard + tools` → tool-backed expert loop |
 | **Review**  | `proceed` / `re-execute` / `add_tasks` | Quality gate after execution. Re-execute weak tasks or add new sub-tasks (max 2 rounds). |
+
+### CLI Experience
+
+The REPL now uses a `rich`-rendered layout that separates output from input. Recent updates include:
+
+- colored command/status output and a fixed bottom prompt area
+- styled `/help`, `/sessions`, `/model`, `/summary`, `/trace`, and `/tokens` views
+- tree-based trace rendering with span status, timing, tokens, and metadata
+- terminal command confirmation prompts rendered consistently inside the CLI
 
 ---
 
@@ -85,7 +93,7 @@ All commands are entered at the REPL prompt.
 | `/sessions delete <id>` | Delete a session                                              |
 | `/skim [path]`          | Scan the project and generate `HPD.MD` knowledge summary      |
 | `/summary`              | Summarize context and reset the context window (saves tokens) |
-| `/tokens`               | Show current token usage                                      |
+| `/tokens`               | Show context-window occupancy and next-request estimates      |
 | `/trace [on\|half\|off]`| Toggle tracing: on (console+file), half (console only), off. Persisted across restarts. |
 
 ---
@@ -167,9 +175,17 @@ This file is automatically injected into the boot prompt as project context.
 
 HPD-Agent tracks token usage in real-time. Use these commands to manage your context window:
 
-- `/tokens` — View current token count and limits
+- `/tokens` — View resident context usage, remaining window, and rough next-call estimates
 - `/summary` — Compress conversation history to save tokens
 - `/context` — Inspect and prune the context window
+
+`/tokens` is intentionally focused on the resident context that will be injected on the next turn, which is the closest analogue to Codex/Claude Code style “context window used”. It also shows tool-schema overhead and analysis cache separately so the headline number is not inflated by non-resident data.
+
+## Planning and Execution Notes
+
+- Multi-solution prompts such as “give me at least three different approaches” are now expanded into independent parallel subtasks instead of a single coarse expert task.
+- Tool-enabled execution has explicit round and tool-call budgets. When a budget is exhausted, the agent does a final no-tool synthesis from the evidence already collected instead of returning only partial tool traces.
+- Simple-path `direct_answer()` now uses the same tool budget and confirmation flow as complex-task execution.
 
 ---
 
@@ -194,6 +210,7 @@ python-dotenv>=1.0.0
 tiktoken>=0.7.0
 dacite>=0.8.0
 prompt_toolkit>=3.0.0
+rich>=13.0.0
 ```
 
 ---

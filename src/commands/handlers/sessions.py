@@ -10,6 +10,7 @@ Sub-commands:
 import uuid
 
 from src.agents import QueryAgent
+from src.cli import get_renderer
 from src.memory import ConversationContext
 
 
@@ -20,42 +21,36 @@ def _run_list(agent: QueryAgent) -> None:
     from src.memory.session_store import _store_dir
     ph = getattr(agent, "_project_hash", "unknown")
     store_path = _store_dir(ph)
-    print(f"Sessions for current project [{ph}] (stored at {store_path}):\n")
-
-    if not agent._contexts:
-        print("  No active sessions in this project.")
-        return
-
     current = agent._current_session
-    for sid in sorted(agent._contexts):
-        marker = " <-- current" if sid == current else ""
-        count = len(agent._contexts[sid].messages)
-        print(f"  [{sid}]  ({count} messages){marker}")
-    print()
+    rows = [
+        (sid, len(agent._contexts[sid].messages), sid == current)
+        for sid in sorted(agent._contexts)
+    ]
+    get_renderer().render_sessions(ph, store_path, rows)
 
 
 def _run_create(agent: QueryAgent) -> None:
     new_id = uuid.uuid4().hex[:8]
     agent._contexts[new_id] = ConversationContext()
     agent._current_session = new_id
-    print(f"New session created: [{new_id}]")
+    get_renderer().success(f"New session created: [{new_id}]")
 
 
 def _run_switch(agent: QueryAgent, target: str) -> None:
     if target not in agent._contexts:
-        print(f"Session not found: [{target}]")
+        get_renderer().error(f"Session not found: [{target}]")
         return
     agent._current_session = target
     msg_count = len(agent._get_context(target).messages)
-    print(f"Switched to session [{target}] ({msg_count} messages)")
+    get_renderer().success(f"Switched to session [{target}] ({msg_count} messages)")
 
 
 def _run_delete(agent: QueryAgent, target: str) -> None:
     deleted = agent.delete_session(target)
     if deleted:
-        print(f"Session [{target}] deleted.")
+        get_renderer().success(f"Session [{target}] deleted.")
     else:
-        print(f"Session [{target}] not found.")
+        get_renderer().error(f"Session [{target}] not found.")
 
 
 def run(raw: str, agent: QueryAgent) -> bool:
@@ -69,8 +64,8 @@ def run(raw: str, agent: QueryAgent) -> bool:
     sub = parts[1].lower()
 
     if sub not in VALID_SUBS:
-        print(f"Unknown sub-command: '{sub}'")
-        print(f"Valid sub-commands: {', '.join(VALID_SUBS)}\n")
+        get_renderer().error(f"Unknown sub-command: '{sub}'")
+        get_renderer().info(f"Valid sub-commands: {', '.join(VALID_SUBS)}")
         return False
 
     if sub == "list":
@@ -83,14 +78,14 @@ def run(raw: str, agent: QueryAgent) -> bool:
 
     if sub == "switch":
         if len(parts) < 3:
-            print("Usage: /sessions switch <session-id>\n")
+            get_renderer().error("Usage: /sessions switch <session-id>")
             return False
         _run_switch(agent, parts[2])
         return False
 
     if sub == "delete":
         if len(parts) < 3:
-            print("Usage: /sessions delete <session-id>\n")
+            get_renderer().error("Usage: /sessions delete <session-id>")
             return False
         _run_delete(agent, parts[2])
         return False

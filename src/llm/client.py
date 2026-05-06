@@ -16,6 +16,7 @@ from langchain_openai import ChatOpenAI
 from langchain_openai.chat_models.base import BaseChatOpenAI
 from pydantic import BaseModel
 
+from src.cli import get_renderer
 from src.core.observability import TokenTrackerCallback
 
 # ----------------------------------------------------------------------
@@ -73,6 +74,9 @@ _install_token_tracker()
 # ----------------------------------------------------------------------
 _seen_tool_call_ids: set[str] = set()
 """Track which tool_call IDs have already been executed to prevent duplicate calls."""
+
+DEFAULT_MAX_TOOL_ROUNDS = 30
+DEFAULT_MAX_TOOL_CALLS = 80
 
 
 def _reset_seen_tool_call_ids() -> None:
@@ -156,6 +160,31 @@ def get_llm_with_tools(
     return llm
 
 
+async def _finalize_with_available_context(
+    messages: list,
+    reason: str,
+    model: str | None = None,
+    temperature: float | None = None,
+    base_url: str | None = None,
+) -> str:
+    """Produce a best-effort final answer after tool budget exhaustion.
+
+    Uses the already-collected tool results in the conversation and performs
+    one last no-tool model call so the current task can still conclude with a
+    reasoned answer instead of returning only partial tool traces.
+    """
+    llm = get_llm(model=model, temperature=temperature, base_url=base_url)
+    finalize_prompt = (
+        "工具调用预算已经耗尽，不能再调用任何工具。\n"
+        f"原因：{reason}\n\n"
+        "请基于本轮对话中已经存在的工具返回结果，给出当前任务的最佳可得结论。"
+        "如果信息不完整或无法完全确认，请明确指出哪些部分仍未验证。"
+        "不要再请求工具，也不要假装已获取未出现的信息。"
+    )
+    response = await llm.ainvoke([*messages, HumanMessage(content=finalize_prompt)])
+    return getattr(response, "content", "") or ""
+
+
 async def invoke_with_tools(
     prompt: str,
     tools: list[BaseTool] | None = None,
@@ -163,6 +192,9 @@ async def invoke_with_tools(
     temperature: float | None = None,
     base_url: str | None = None,
     stream: bool = False,
+    max_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+    max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
+    on_budget_exceeded: str = "finalize",
 ) -> tuple[str, str]:
     """Invoke the LLM with tool-calling support.
 
@@ -187,8 +219,8 @@ async def invoke_with_tools(
     full_content = ""
     active_model = ""
 
-    max_turns = 20
-    for _ in range(max_turns):
+    tool_call_count = 0
+    for _ in range(max_rounds):
         response = await llm.ainvoke(messages)
 
         usage = getattr(response, "usage_metadata", None) or {}
@@ -206,7 +238,25 @@ async def invoke_with_tools(
             full_content = content
             break
 
+        if tool_call_count + len(tool_calls) > max_tool_calls:
+            reason = (
+                f"Tool budget exceeded: {tool_call_count + len(tool_calls)} calls "
+                f"would exceed limit {max_tool_calls}."
+            )
+            if on_budget_exceeded == "raise":
+                raise RuntimeError(reason)
+            print(f"[DEBUG] {reason}")
+            full_content = await _finalize_with_available_context(
+                messages,
+                reason=reason,
+                model=model,
+                temperature=temperature,
+                base_url=base_url,
+            )
+            break
+
         for call in tool_calls:
+            tool_call_count += 1
             call_id = call.get("id", "")
             name = call.get("name") or ""
             args = call.get("args") or {}
@@ -241,8 +291,8 @@ async def invoke_with_tools(
                         result = tool.invoke(args)
                         success = not str(result).startswith("[Error]")
                     else:
-                        confirm = input("    Confirm execution? (y/N): ").strip().lower()
-                        if confirm != "y":
+                        confirm = get_renderer().confirm(f"Allow terminal command? {cmd}")
+                        if not confirm:
                             result = "[Cancelled] User declined to execute the terminal command"
                             print(f"[DEBUG] Tool '{name}' cancelled by user")
                         else:
@@ -262,5 +312,18 @@ async def invoke_with_tools(
             messages.append(ToolMessage(name=name, content=str(result), tool_call_id=call_id))
             args_str = ", ".join(f"{k}={v!r}" for k, v in args.items()) if args else ""
             tool_results.append(f"[Tool: {name}({args_str})]\n{result}")
+
+    else:
+        reason = f"Tool interaction exceeded max rounds ({max_rounds}) without final response."
+        if on_budget_exceeded == "raise":
+            raise RuntimeError(reason)
+        print(f"[DEBUG] {reason}")
+        full_content = await _finalize_with_available_context(
+            messages,
+            reason=reason,
+            model=model,
+            temperature=temperature,
+            base_url=base_url,
+        )
 
     return full_content, "\n\n".join(tool_results)

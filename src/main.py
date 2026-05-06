@@ -25,15 +25,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.agents import QueryAgent
+from src.cli import get_renderer
 from src.core.observability import get_tracer, TokenTrackerCallback
 from src.llm import get_llm
 from src.commands import COMMAND_HANDLERS, handle_command, get_completer
-from src.commands.handlers.tokens import get_used_tokens, MAX_TOKENS
-from src.commands.handlers.trace import is_trace_enabled, is_trace_save_enabled
+from src.commands.handlers.tokens import get_used_tokens, estimate_next_request_tokens, MAX_TOKENS
+from src.commands.handlers.trace import is_trace_enabled, is_trace_save_enabled, get_trace_mode
+from src.models import get_store
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.styles import Style
+
+
+_renderer = get_renderer()
+_active_agent: QueryAgent | None = None
 
 
 # ----------------------------------------------------------------------
@@ -58,12 +66,49 @@ def _build_session() -> PromptSession:
         key_bindings=kb,
         enable_history_search=False,
         complete_while_typing=True,
-        prompt_continuation=" | ",
+        prompt_continuation="  │ ",
         completer=get_completer(),
+        bottom_toolbar=_build_toolbar,
+        style=Style.from_dict(
+            {
+                "bottom-toolbar": "bg:#0f172a #cbd5e1",
+            }
+        ),
     )
 
 
-def _read_input(prompt: str) -> str:
+def _build_toolbar() -> HTML:
+    agent = _active_agent
+    session_id = getattr(agent, "_current_session", "default")
+    trace_mode = get_trace_mode().upper()
+    try:
+        model_name = get_store().active_profile().model
+    except Exception:
+        model_name = "unknown"
+    return HTML(
+        "  <b fg='#22d3ee'>Session</b> "
+        f"<style fg='#e2e8f0'>{session_id}</style>  "
+        "<b fg='#22d3ee'>Model</b> "
+        f"<style fg='#e2e8f0'>{model_name}</style>  "
+        "<b fg='#22d3ee'>Trace</b> "
+        f"<style fg='#e2e8f0'>{trace_mode}</style>  "
+        "<style fg='#94a3b8'>Ctrl+J newline • /help commands</style>"
+    )
+
+
+def _build_prompt_message(agent: QueryAgent) -> HTML:
+    width = _renderer.prompt_width()
+    session_id = agent._current_session
+    top = "─" * width
+    return HTML(
+        f"<style fg='#475569'>{top}</style>\n"
+        f"<b fg='#22d3ee'>Input</b> "
+        f"<style fg='#e2e8f0'>[{session_id}]</style>\n"
+        "<style fg='#94a3b8'>╰─› </style>"
+    )
+
+
+def _read_input(prompt: HTML) -> str:
     """Read input via prompt_toolkit — true multi-line editing with full cursor control."""
     try:
         return _session.prompt(prompt)
@@ -78,7 +123,7 @@ def _read_input(prompt: str) -> str:
 _session = _build_session()
 
 
-async def _read_line(prompt: str) -> str:
+async def _read_line(prompt: HTML) -> str:
     """Run the blocking prompt_toolkit call in a thread pool."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _read_input, prompt)
@@ -91,26 +136,20 @@ async def _read_line(prompt: str) -> str:
 
 async def run_loop():
     tracer = get_tracer()
-
-    print(r"""
-            ██╗  ██╗ ██████╗  ██████╗
-            ██║  ██║ ██╔══██╗ ██╔══██╗
-            ███████║ ██████╔╝ ██║  ██║
-            ██╔══██║ ██╔═══╝  ██║  ██║
-            ██║  ██║ ██║      ██████╔╝
-            ╚═╝  ╚═╝ ╚═╝      ╚═════╝
-    """)
-    print("  Ctrl+Enter for new line, Enter to submit, Ctrl+C to cancel.\n")
-    print("  Type /exit to quit.\n")
+    _renderer.install_print_hook()
+    _renderer.render_banner()
 
     agent = QueryAgent()
+    global _active_agent
+    _active_agent = agent
     get_completer().set_agent(agent)
 
     while True:
         try:
-            query = await _read_line(f"[{agent._current_session}] > ")
+            query = await _read_line(_build_prompt_message(agent))
         except (KeyboardInterrupt, EOFError):
-            print("\nGoodbye!")
+            _renderer.blank()
+            _renderer.info("Goodbye!")
             break
 
         if not query:
@@ -120,25 +159,32 @@ async def run_loop():
                 break
             continue
 
-        print()
+        _renderer.blank()
 
-        tokens = get_used_tokens(agent)
+        tokens = estimate_next_request_tokens(agent, query)
         if tokens > MAX_TOKENS:
-            print("Token limit reached. Please create a new conversation or run /summary to summarize the conversation.")
+            occupied = get_used_tokens(agent)
+            _renderer.warning(
+                "Token limit reached for the next request. "
+                f"occupied={occupied}, next_estimate={tokens}. "
+                "Please create a new conversation or run /summary to summarize the conversation."
+            )
             continue
 
         _tracing = is_trace_enabled()
         if _tracing:
             trace_id = tracer.start_trace(query=query, session_id=agent._current_session)
             TokenTrackerCallback.reset()
-            print(f"\n[trace:{trace_id}] 开始处理...\n")
+            _renderer.rule(f"Run • trace:{trace_id}", style="trace")
+            _renderer.info("开始处理...")
 
         try:
             result = await agent.ainvoke(query, agent._current_session)
 
             # Complex path: stream synthesis, record tokens
             if result.get("synthesis_prompt"):
-                print("\n─── 最终回答 ───\n")
+                _renderer.blank()
+                _renderer.rule("Final Answer", style="accent")
                 if _tracing:
                     with tracer.span("synthesis_stream") as synthesis_span_id:
                         llm = get_llm(stream=True)
@@ -147,7 +193,7 @@ async def run_loop():
                             t = getattr(chunk, "content", "") or ""
                             if t:
                                 streamed_answer += t
-                                print(t, end="", flush=True)
+                                _renderer.stream_answer(t)
                         agent.store_streamed_answer(streamed_answer)
                         tin, tout, model = TokenTrackerCallback.snapshot()
                         tracer.record_tokens(synthesis_span_id, tokens_in=tin, tokens_out=tout, model=model)
@@ -156,12 +202,13 @@ async def run_loop():
             if _tracing:
                 record = tracer.end_trace()
                 if record is not None:
+                    _renderer.blank()
                     record.print_console()
                     if is_trace_save_enabled():
                         path = record.save()
-                        print(f"\n  Trace saved: {path}")
+                        _renderer.success(f"Trace saved: {path}")
 
-        print()
+        _renderer.blank()
 
 
 def _parse_args():

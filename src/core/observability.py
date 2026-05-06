@@ -134,53 +134,15 @@ class TraceRecord:
 
     def print_console(self) -> None:
         """Print a hierarchical span tree to stdout."""
+        from src.cli import get_renderer
+
         id_map: dict[str, TraceSpan] = {s.span_id: s for s in self.spans}
         children: dict[str, list[str]] = self._tree()
 
-        def fmt_span(s: TraceSpan, prefix: str, is_last: bool) -> None:
-            connector = "└─ " if is_last else "├─ "
-            bar = "─" * (50 - len(prefix) - len(connector))
-            dur = f"{s.duration_ms / 1000:.2f}s"
-            status_icon = "✓" if s.status == "ok" else "✗"
-            extra = ""
-            if s.tokens_in or s.tokens_out:
-                extra = f"  tokens: in={s.tokens_in} out={s.tokens_out}"
-            elif s.duration_ms > 500:
-                extra = ""
-
-            line = f"[{self.trace_id}] {prefix}{connector}{s.name} {bar} {dur} {status_icon}{extra}"
-            print(line)
-            if s.status == "error":
-                print(f"[{self.trace_id}]   └─ ERROR: {s.error_msg}")
-
-            sub = children.get(s.span_id, [])
-            for i, child_id in enumerate(sub):
-                child = id_map.get(child_id)
-                if child:
-                    ext = "    " if is_last else "│   "
-                    fmt_span(child, prefix + ext, i == len(sub) - 1)
-
         # Find root spans (no parent)
         roots = children.get("", [])
-        roots.sort(key=lambda sid: id_map[sid].start_ms)
-        for i, sid in enumerate(roots):
-            s = id_map[sid]
-            fmt_span(s, "", i == len(roots) - 1)
-
-        # Summary
-        sep = f"[{self.trace_id}] " + "─" * 57
-        print(sep)
-        total_dur = self.duration_ms / 1000
-        total_in  = self.total_tokens_in
-        total_out = self.total_tokens_out
-        cost      = self.estimate_cost()
-        print(
-            f"[{self.trace_id}] "
-            f"总耗时: {total_dur:.2f}s  |  "
-            f"总 token: in={total_in} out={total_out}  |  "
-            f"成本估算: ${cost:.6f}"
-        )
-        print(sep)
+        root_spans = sorted((id_map[sid] for sid in roots if sid in id_map), key=lambda span: span.start_ms)
+        get_renderer().render_trace_record(self, root_spans, children, id_map)
 
     def save(self) -> Path:
         _DATADIR.mkdir(parents=True, exist_ok=True)

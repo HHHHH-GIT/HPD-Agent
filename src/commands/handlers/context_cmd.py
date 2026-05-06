@@ -1,6 +1,7 @@
 """Handler for the /context command."""
 
 from src.agents import QueryAgent
+from src.cli import get_renderer
 from src.memory.context import ConversationContext, MessageRole
 
 
@@ -79,11 +80,11 @@ def run(raw: str, agent: QueryAgent) -> bool:
         ctx = agent._get_context()
         ctx.messages.clear()
         ctx.sub_task_outputs.clear()
-        print("上下文已清空。")
+        get_renderer().success("上下文已清空。")
         return False
 
     ctx = agent._get_context()
-    _print_context(ctx, sub_args=sub_args)
+    _print_context(ctx, sub_args=sub_args, session_id=agent._current_session)
     return False
 
 
@@ -102,29 +103,15 @@ def _print_context(
     count, full_content = _parse_context_args(sub_args)
     messages = context.messages if context else []
 
-    print(f"=== Context (session: {session_id}) ===")
-
-    if not messages:
-        print("  (no messages in context)")
-        print("=" * 36)
-        return
-
-    print(f"  total: {len(messages)} messages, max_turns: {context.max_turns}")
-
     if count == 0:
         to_show = list(enumerate(messages))
     else:
         recent = list(enumerate(messages[-count * 2:]))
         to_show = [(len(messages) - len(recent) + i, pair[1]) for i, pair in enumerate(recent)]
-
-    if not to_show:
-        print("  (no messages to show)")
-        print("=" * 36)
-        return
-
-    print()
+    entries = []
     for idx, msg in reversed(to_show):
-        print(_format_message(msg, idx + 1, full_content))
-        print()
-
-    print("=" * 36)
+        role = "用户" if msg.role == MessageRole.USER else "助手"
+        ts = msg.timestamp.strftime("%H:%M:%S")
+        content = _format_message(msg, idx + 1, full_content).split("\n", 1)[1].strip()
+        entries.append((role, ts, content))
+    get_renderer().render_context(session_id, len(messages), context.max_turns, entries)

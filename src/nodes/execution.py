@@ -1,20 +1,22 @@
-"""Execution node: difficulty assessment + LLM execution for a single sub-task.
+"""Execution node: route a sub-task across difficulty and tool requirements.
 
 This is a pure business-logic node — no graph coupling, no state mutation.
 It handles:
   - Sub-task difficulty assessment (easy / hard)
-  - Easy tasks: single LLM call (no tools)
-  - Hard tasks: multi-path generation + evaluate→reflect iteration
+  - Tool requirement assessment (requires_tools true / false)
+  - Easy + no-tools: single LLM call
+  - Easy + tools: single tool-backed execution
+  - Hard + no-tools: TOT multi-path + evaluate→reflect
+  - Hard + tools: tool-backed evaluate→reflect loop
   - Summary extraction
   - Tool-usage tracking (which files/resources were read)
   - Key-finding extraction (structured facts for downstream context)
-
-The expert agent calls this to make the "execute" decision.
 """
 
 import asyncio
 import json
 import re
+from dataclasses import dataclass
 
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
@@ -43,6 +45,12 @@ from src.tools import tool_list
 NUM_CANDIDATES = 3
 EXPERT_SCORE_THRESHOLD = 0.7
 MAX_EXPERT_ITERATIONS = 2
+
+
+@dataclass
+class ExecutionArtifact:
+    detail: str
+    tool_log: str = ""
 
 
 def _extract_summary(detail: str) -> str:
@@ -218,6 +226,36 @@ async def _execute_candidate(
     )
 
 
+def _task_heuristically_requires_tools(task_name: str, context: str) -> bool:
+    """Conservative heuristic to prevent tool-required tasks from entering no-tool paths."""
+    text = f"{task_name}\n{context}".lower()
+    keywords = (
+        "read ", "open ", "inspect ", "check ", "compare ", "edit ", "modify ",
+        "fix ", "debug ", "trace ", "run ", "execute ", "terminal", "command",
+        "file", "files", "repo", "repository", "project", "config", "log",
+        "src/", "tests/", ".py", ".md", ".json", ".toml", ".yaml", ".yml",
+        "目录", "文件", "代码", "仓库", "配置", "日志", "命令", "终端", "读取", "修改", "比较", "检查",
+    )
+    return any(token in text for token in keywords)
+
+
+async def _execute_single_no_tools(task_id: int, task_name: str, context: str) -> ExecutionArtifact:
+    prompt = SUB_TASK_PROMPT.format(
+        context=context, task_id=task_id, task_name=task_name
+    )
+    llm = get_llm()
+    response = await llm.ainvoke([HumanMessage(content=prompt)])
+    return ExecutionArtifact(detail=response.content or "")
+
+
+async def _execute_single_with_tools(task_id: int, task_name: str, context: str) -> ExecutionArtifact:
+    prompt = SUB_TASK_PROMPT.format(
+        context=context, task_id=task_id, task_name=task_name
+    )
+    full_content, tool_log = await invoke_with_tools(prompt, tools=tool_list)
+    return ExecutionArtifact(detail=full_content or "", tool_log=tool_log)
+
+
 async def _execute_multipath(
     task_id: int,
     task_name: str,
@@ -269,23 +307,19 @@ async def _execute_multipath(
     return valid_candidates, valid_scores
 
 
-async def _expert_loop(
+async def _tot_expert_loop(
     task_id: int,
     task_name: str,
     context: str,
-) -> SubTaskOutput:
-    """Expert mode for hard tasks: multi-path generation + evaluate→reflect iteration.
+) -> ExecutionArtifact:
+    """Hard non-tool task path: TOT multi-path generation + evaluate→reflect.
 
     Flow:
       1. Multi-path: rewrite → N candidates → 1:1 evaluate each → pick best
       2. Evaluate best result
-      3. If score < threshold: reflect → re-execute with tools → re-evaluate
+      3. If score < threshold: reflect → re-execute without tools → re-evaluate
       4. Repeat up to MAX_EXPERT_ITERATIONS
     """
-    tracer = get_tracer()
-    span_id = None  # Will be set by caller's span
-
-    # ── Step A: Multi-path generation ────────────────────────────────
     best_detail = ""
     best_score_obj: EvaluatorScore | None = None
 
@@ -298,20 +332,14 @@ async def _expert_loop(
         print(f"[TOT] Task {task_id}: {len(candidates)} candidates, "
               f"best score={best_score_obj.score:.2f} (candidate {best_idx})")
     except Exception as e:
-        print(f"[TOT] Task {task_id}: multi-path failed ({e}), using single-path")
-        # Fall back: single execution with tools
-        prompt = SUB_TASK_PROMPT.format(
-            context=context, task_id=task_id, task_name=task_name
-        )
-        full_content, tool_log = await invoke_with_tools(prompt, tools=tool_list)
-        best_detail = full_content or ""
+        print(f"[TOT] Task {task_id}: multi-path failed ({e}), using single-path without TOT")
+        artifact = await _execute_single_no_tools(task_id, task_name, context)
+        best_detail = artifact.detail
 
-    # ── Step B: Evaluate→Reflect iteration (all hard tasks) ──────────
     current_detail = best_detail
     current_score = best_score_obj
 
     for iteration in range(MAX_EXPERT_ITERATIONS):
-        # Evaluate if not already scored (single-path fallback)
         if current_score is None:
             current_score = await evaluate_single(current_detail, task_name, context)
 
@@ -332,17 +360,61 @@ async def _expert_loop(
               f"threshold={EXPERT_SCORE_THRESHOLD}, reflecting... (iteration {iteration + 1}/{MAX_EXPERT_ITERATIONS})")
         reflection = await reflect(task_name, context, current_detail, current_score)
 
-        # Re-execute with improved prompt (with tools)
-        improved_prompt = SUB_TASK_PROMPT.format(
-            context=context,
+        artifact = await _execute_single_no_tools(
             task_id=task_id,
             task_name=f"{task_name}\n\n【改进策略】{reflection.strategy}",
+            context=context,
         )
-        full_content, tool_log = await invoke_with_tools(improved_prompt, tools=tool_list)
-        current_detail = full_content or ""
-        current_score = None  # Force re-evaluation
+        current_detail = artifact.detail
+        current_score = None
 
-    return current_detail
+    return ExecutionArtifact(detail=current_detail)
+
+
+async def _tool_backed_expert_loop(
+    task_id: int,
+    task_name: str,
+    context: str,
+) -> ExecutionArtifact:
+    """Hard task path when real tool execution is required."""
+    artifact = await _execute_single_with_tools(task_id, task_name, context)
+    current_detail = artifact.detail
+    tool_logs: list[str] = [artifact.tool_log] if artifact.tool_log else []
+    current_score: EvaluatorScore | None = None
+
+    for iteration in range(MAX_EXPERT_ITERATIONS):
+        if current_score is None:
+            current_score = await evaluate_single(current_detail, task_name, context)
+
+        print(f"[Expert] Task {task_id}: score={current_score.score:.2f} "
+              f"{'(iteration ' + str(iteration + 1) + '/' + str(MAX_EXPERT_ITERATIONS) + ')' if iteration > 0 or current_score.score < EXPERT_SCORE_THRESHOLD else ''}")
+
+        if current_score.score >= EXPERT_SCORE_THRESHOLD:
+            print(f"[Expert] Task {task_id}: score={current_score.score:.2f} >= "
+                  f"threshold={EXPERT_SCORE_THRESHOLD}, accepted")
+            break
+
+        if iteration >= MAX_EXPERT_ITERATIONS - 1:
+            print(f"[Expert] Task {task_id}: max iterations reached, using current result")
+            break
+
+        print(f"[Expert] Task {task_id}: score={current_score.score:.2f} < "
+              f"threshold={EXPERT_SCORE_THRESHOLD}, reflecting with tools... (iteration {iteration + 1}/{MAX_EXPERT_ITERATIONS})")
+        reflection = await reflect(task_name, context, current_detail, current_score)
+        artifact = await _execute_single_with_tools(
+            task_id=task_id,
+            task_name=f"{task_name}\n\n【改进策略】{reflection.strategy}",
+            context=context,
+        )
+        current_detail = artifact.detail
+        if artifact.tool_log:
+            tool_logs.append(artifact.tool_log)
+        current_score = None
+
+    return ExecutionArtifact(
+        detail=current_detail,
+        tool_log="\n\n".join(log for log in tool_logs if log),
+    )
 
 
 def _build_output(
@@ -375,10 +447,7 @@ def _build_output(
 
 
 async def execute(task_id: int, task_name: str, context: str) -> SubTaskOutput:
-    """Assess difficulty and execute a single sub-task.
-
-    - Easy tasks: single LLM call, no tools (like direct_answer).
-    - Hard tasks: multi-path generation + evaluate→reflect iteration.
+    """Assess a sub-task and route it across difficulty + tool requirements.
 
     Args:
         task_id:   Sub-task ID from the DAG.
@@ -390,39 +459,40 @@ async def execute(task_id: int, task_name: str, context: str) -> SubTaskOutput:
     """
     tracer = get_tracer()
     with tracer.span(f"execution[#{task_id}]", metadata={"task_name": task_name}) as span_id:
-        # Step 1: Difficulty assessment
         classifier = get_structured_llm(SubTaskAssessmentResult)
         assessment: SubTaskAssessmentResult = await classifier.ainvoke(
-            SUB_TASK_ASSESSMENT_PROMPT.format(task_id=task_id, task_name=task_name)
+            SUB_TASK_ASSESSMENT_PROMPT.format(
+                task_id=task_id,
+                task_name=task_name,
+                context=context[:2000],
+            )
         )
         is_expert = assessment.difficulty == SubTaskDifficulty.HARD
+        requires_tools = assessment.requires_tools or _task_heuristically_requires_tools(task_name, context)
 
-        # Record assessment tokens
         tin0, tout0, model0 = TokenTrackerCallback.snapshot()
         tracer.record_tokens(span_id, tokens_in=tin0, tokens_out=tout0, model=model0)
 
-        # Step 2: Branch by difficulty
-        if not is_expert:
-            # Easy: single LLM call, no tools
-            print(f"[Expert] Task {task_id}: easy, single call")
-            prompt = SUB_TASK_PROMPT.format(
-                context=context, task_id=task_id, task_name=task_name
-            )
-            llm = get_llm()
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
-            content = response.content or ""
+        if not is_expert and not requires_tools:
+            print(f"[Expert] Task {task_id}: easy, single call without tools")
+            artifact = await _execute_single_no_tools(task_id, task_name, context)
+        elif not is_expert and requires_tools:
+            print(f"[Expert] Task {task_id}: easy, single call with tools")
+            artifact = await _execute_single_with_tools(task_id, task_name, context)
+        elif is_expert and requires_tools:
+            print(f"[Expert] Task {task_id}: hard + tool-backed, skipping TOT")
+            artifact = await _tool_backed_expert_loop(task_id, task_name, context)
+        else:
+            print(f"[Expert] Task {task_id}: hard + no-tools, entering TOT expert loop")
+            artifact = await _tot_expert_loop(task_id, task_name, context)
 
-            tin, tout, model = TokenTrackerCallback.snapshot()
-            tracer.record_tokens(span_id, tokens_in=tin, tokens_out=tout, model=model)
-
-            return _build_output(task_id, task_name, content, is_expert=False)
-
-        # Hard: Expert mode — multi-path + evaluate→reflect
-        print(f"[Expert] Task {task_id}: hard, entering expert loop")
-        detail = await _expert_loop(task_id, task_name, context)
-
-        # Record tokens
         tin, tout, model = TokenTrackerCallback.snapshot()
         tracer.record_tokens(span_id, tokens_in=tin, tokens_out=tout, model=model)
 
-        return _build_output(task_id, task_name, detail, is_expert=True)
+        return _build_output(
+            task_id,
+            task_name,
+            artifact.detail,
+            is_expert=is_expert,
+            tool_log=artifact.tool_log,
+        )

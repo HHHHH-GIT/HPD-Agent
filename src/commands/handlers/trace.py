@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from src.agents import QueryAgent
+from src.cli import get_renderer
 
 _CONFIG_PATH = Path.home() / ".hpagent" / "config.json"
 
@@ -55,34 +56,39 @@ def is_trace_save_enabled() -> bool:
     return _trace_mode == "on"
 
 
+def get_trace_mode() -> str:
+    return _trace_mode
+
+
 # Load persisted config on import
 _load_config()
 
 
 def run(raw: str, agent: QueryAgent) -> bool:
     global _trace_mode
+    renderer = get_renderer()
 
     parts = raw.strip().split()
     if len(parts) == 1:
         labels = {"on": "启用（完整）", "half": "仅控制台", "off": "禁用"}
-        print(f"链路追踪当前: {labels.get(_trace_mode, _trace_mode)}")
+        renderer.render_trace_mode(f"链路追踪当前: {labels.get(_trace_mode, _trace_mode)}")
         return False
 
     sub = parts[1].lower()
     if sub in ("on", "1", "enable", "true"):
         _trace_mode = "on"
         _save_config()
-        print("链路追踪: 已启用（控制台 + 文件）")
+        renderer.success("链路追踪: 已启用（控制台 + 文件）")
     elif sub in ("half", "console"):
         _trace_mode = "half"
         _save_config()
-        print("链路追踪: 仅控制台输出，不保存文件")
+        renderer.info("链路追踪: 仅控制台输出，不保存文件")
     elif sub in ("off", "0", "disable", "false"):
         _trace_mode = "off"
         _save_config()
-        print("链路追踪: 已禁用")
+        renderer.warning("链路追踪: 已禁用")
     else:
-        print("用法: /trace [on|half|off]")
+        renderer.error("用法: /trace [on|half|off]")
         return False
 
     return False

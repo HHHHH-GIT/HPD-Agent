@@ -1,22 +1,21 @@
-"""Handler for the /tokens command — shows context window token usage.
+"""Handler for the /tokens command — focuses on context window occupancy.
 
-Token accounting follows the actual LLM context payload consumed in the synthesizer:
-  1. conversation_history (messages)           ← always counted
-  2. sub_task_outputs (accumulated DAG results) ← not stored in messages, but
-     consumed by the synthesizer when building the final answer
-  3. tool schemas (bind_tools overhead)         ← sent with every tool-bound call
-  4. current synthesis prompt (if building)    ← the in-flight prompt
+The headline number is the resident context that will be injected into the
+next turn before the user's next query is added. This is the closest analogue
+to Codex/Claude Code's "Context window used" indicator.
 
-System prompts (assessment, planner, synthesis instructions) are NOT counted as
-part of the rolling context window — they are injected per-call and not
-persisted.  Only the accumulating conversation state is tracked here.
+Secondary rows show rough next-call estimates so users can tell whether a new
+query is likely to overflow even when the resident context itself still fits.
 """
 
 import concurrent.futures
 import json
 
 from src.agents import QueryAgent
+from src.cli import get_renderer
+from src.llm import ASSESSMENT_PROMPT
 from src.memory.context import ConversationContext
+from src.system_info import build_boot_prompt
 
 
 # cl100k_base context window for the model (conservative: 128k for deepseek-v4)
@@ -64,39 +63,69 @@ def _count_tool_schema_tokens() -> int:
 
 
 def _count_context_tokens(ctx: ConversationContext) -> int:
-    """Count tokens for the rolling conversation_history (messages only).
+    """Count resident tokens for the history block as actually injected."""
+    return _count_tokens(_build_history_section(ctx))
 
-    Each message is formatted as "{role}: {content}" per langchain convention.
-    """
-    enc = _get_encoder()
-    total = 0
-    for msg in ctx.messages:
-        text = f"{msg.role.value}: {msg.content}"
-        total += len(enc.encode(text))
-    return total
+
+def _build_history_text(ctx: ConversationContext) -> str:
+    return ctx.to_summary()
+
+
+def _build_history_section(ctx: ConversationContext) -> str:
+    history_text = _build_history_text(ctx)
+    return f"【对话历史】\n{history_text}\n\n" if history_text else ""
+
+
+def _build_history_section_for_agent(agent: QueryAgent) -> str:
+    ctx = agent._get_context()
+    history_text = _build_history_text(ctx)
+    sid = getattr(agent, "_current_session", "default")
+    if sid not in getattr(agent, "_session_boot_done", set()):
+        boot_line = f"助手: {build_boot_prompt()}"
+        history_text = f"{boot_line}\n{history_text}" if history_text else boot_line
+    return f"【对话历史】\n{history_text}\n\n" if history_text else ""
+
+
+def _build_direct_answer_prompt(history_section: str, query: str) -> str:
+    if history_section:
+        return (
+            f"{history_section}"
+            f"【当前问题】\n{query}\n\n"
+            "【重要规则】\n"
+            "1. 如果问题需要获取实时信息或执行操作，你必须调用可用工具，不允许自己输出命令或猜测结果。\n"
+            "2. 请基于对话历史，直接、简洁地回答用户的问题。如果问题是对之前话题的追问，"
+            "请结合历史上下文作答。如果不知道答案，请诚实说明。"
+        )
+    return (
+        f"【用户问题】\n{query}\n\n"
+        "【重要规则】\n"
+        "1. 如果问题需要获取实时信息或执行操作，你必须调用可用工具，不允许自己输出命令或猜测结果。\n"
+        "2. 请直接、简洁地回答。如果不知道答案，请诚实说明。"
+    )
+
+
+def get_resident_context_tokens(agent: QueryAgent) -> int:
+    """Return the current resident context occupying the next turn's window."""
+    return _count_tokens(_build_history_section_for_agent(agent))
+
+
+def estimate_next_request_tokens(agent: QueryAgent, query: str) -> int:
+    """Conservative estimate for the next request before it is sent."""
+    history_section = _build_history_section_for_agent(agent)
+    assessment_prompt = ASSESSMENT_PROMPT.format(
+        history_section=history_section,
+        query=query,
+    )
+    direct_prompt = _build_direct_answer_prompt(history_section, query)
+    return max(
+        _count_tokens(assessment_prompt),
+        _count_tokens(direct_prompt) + _count_tool_schema_tokens(),
+    )
 
 
 def get_used_tokens(agent: QueryAgent) -> int:
-    """Get the total tokens consumed by the current session's rolling context.
-
-    This is the real token cost — it includes:
-      - All messages in conversation_history (what's actually sent to the LLM)
-      - All accumulated sub_task_outputs (consumed by the synthesizer but not
-        stored in messages, so invisible to the message-only counter)
-      - Tool schemas from bind_tools() (sent with every tool-bound call)
-    """
-    ctx = agent._get_context()
-    total = _count_context_tokens(ctx)
-
-    # Sub-task outputs are accumulated by QueryAgent and fed to the synthesizer,
-    # but they are NOT stored in messages — they still consume the context window.
-    for output in ctx.sub_task_outputs:
-        total += _count_tokens(f"[子任务 {output['id']}: {output['name']}]\n{output['detail']}")
-
-    # Tool schemas are injected into every tool-bound API request.
-    total += _count_tool_schema_tokens()
-
-    return total
+    """Backward-compatible alias for resident context usage."""
+    return get_resident_context_tokens(agent)
 
 
 def _format_bar(pct: float, width: int = 20) -> str:
@@ -109,10 +138,10 @@ def run(raw: str, agent: QueryAgent) -> bool:
     """Handle /tokens command — print context window token usage."""
     ctx = agent._get_context()
 
-    # Count messages
-    msg_tokens = _count_context_tokens(ctx)
+    resident_tokens = get_resident_context_tokens(agent)
+    left_tokens = max(MAX_TOKENS - resident_tokens, 0)
 
-    # Count sub-task outputs
+    # Count analysis cache kept only for /summary and bookkeeping
     sub_task_tokens = 0
     for output in ctx.sub_task_outputs:
         sub_task_tokens += _count_tokens(
@@ -128,23 +157,32 @@ def run(raw: str, agent: QueryAgent) -> bool:
         if msg.tool_summary:
             tool_tokens += _count_tokens(msg.tool_summary)
 
-    total = msg_tokens + sub_task_tokens + tool_schema_tokens
+    history_section = _build_history_section(ctx)
+    query_placeholder = "<next user query>"
+    next_simple_estimate = _count_tokens(
+        _build_direct_answer_prompt(history_section, query_placeholder)
+    ) + tool_schema_tokens
+    next_assessment_estimate = _count_tokens(
+        ASSESSMENT_PROMPT.format(
+            history_section=history_section,
+            query=query_placeholder,
+        )
+    )
 
-    pct = min(total / MAX_TOKENS, 1.0)
-    bar = _format_bar(pct)
+    pct = min(resident_tokens / MAX_TOKENS, 1.0)
+    get_renderer().render_tokens(
+        resident_tokens=resident_tokens,
+        left_tokens=left_tokens,
+        max_tokens=MAX_TOKENS,
+        pct=pct,
+        next_simple_estimate=next_simple_estimate,
+        next_assessment_estimate=next_assessment_estimate,
+        tool_schema_tokens=tool_schema_tokens,
+        sub_task_tokens=sub_task_tokens,
+        tool_tokens=tool_tokens,
+    )
 
-    print(f"=== Context Token Usage ===")
-    print(f"  Conversation history:  {msg_tokens:>6} tokens  (messages)")
-    print(f"  Sub-task results:     {sub_task_tokens:>6} tokens  (DAG outputs, not in messages)")
-    print(f"  Tool schemas:          {tool_schema_tokens:>6} tokens  (bind_tools overhead)")
-    print(f"  Total:                {total:>6} tokens")
-    print(f"  Model window:        {MAX_TOKENS:>6} tokens")
-    print(f"  Usage:              {bar} {pct * 100:.1f}%")
-    if tool_tokens > 0:
-        print(f"  (tool summaries:      {tool_tokens:>6} tokens — included above)")
-    print()
-
-    if total >= MAX_TOKENS:
-        print("  [WARNING] 上下文窗口已满，请开启新对话或使用 /summary 总结上下文")
+    if resident_tokens >= MAX_TOKENS:
+        get_renderer().warning("上下文窗口已满，请开启新对话或使用 /summary 总结上下文")
 
     return False

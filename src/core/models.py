@@ -98,6 +98,11 @@ class SubTaskAssessmentResult(BaseModel):
         description="Classification: 'easy' for common-knowledge single-step subtasks, "
         "'hard' for multi-step/deep-research/logic-dependent subtasks."
     )
+    requires_tools: bool = Field(
+        default=False,
+        description="Whether the sub-task needs repository files, shell diagnostics, "
+        "or any real external/tool-backed operation to be completed reliably.",
+    )
     reasoning: str = Field(
         description="Brief explanation of why this difficulty level was assigned."
     )

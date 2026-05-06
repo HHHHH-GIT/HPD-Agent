@@ -11,6 +11,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 
 from src.agents import QueryAgent
+from src.cli import get_renderer
 from src.models import ModelStore, get_store
 
 
@@ -37,21 +38,10 @@ _model_session = PromptSession(
 # Formatting helpers                                                          #
 # -------------------------------------------------------------------------- #
 
-def _print_profile(name: str, p: object, is_active: bool, name_width: int) -> None:
-    marker = "   Yes" if is_active else ""
-    print(f"  {name:<{name_width}}   {' ' + getattr(p, 'model', '?'):<24}{marker}")
-
-
 def _print_list(store: ModelStore) -> None:
-    name_width = max((len(p.name) for p in store.all()), default=0)
     active = store.active
-    profiles = store.all()
-    print(f"=== Models ({len(profiles)} total) ===")
-    print(f"  {'Name':<{name_width + 3}} {'Model':<24} {'Active'}")
-    print(f"  {'-' * (name_width + 3)} {'-' * 24} {'-' * 6}")
-    for p in profiles:
-        _print_profile(p.name, p, p.name == active, name_width)
-    print()
+    rows = [(p.name, getattr(p, "model", "?"), p.name == active) for p in store.all()]
+    get_renderer().render_models(rows)
 
 
 # -------------------------------------------------------------------------- #
@@ -80,25 +70,25 @@ def _sanitize_base_url(url: str) -> str:
 
 async def _run_create(store: ModelStore) -> None:
     """Walk the user through creating a new model profile. ESC cancels."""
-    print("\n=== Create New Model ===")
-    print("Press ESC at any prompt to cancel.\n")
-    print("Required:\n")
+    renderer = get_renderer()
+    renderer.render_command_result("Create Model", "Press ESC at any prompt to cancel.", style="accent")
+    renderer.info("Required:")
 
     name = await _read_line("  name")
     if name is None:
-        print("\nCancelled.\n")
+        renderer.warning("Cancelled.")
         return
     model = await _read_line("  model", "deepseek-v4-flash")
     if model is None:
-        print("\nCancelled.\n")
+        renderer.warning("Cancelled.")
         return
     base_url = await _read_line("  base_url", "https://api.deepseek.com")
     if base_url is None:
-        print("\nCancelled.\n")
+        renderer.warning("Cancelled.")
         return
     base_url = _sanitize_base_url(base_url)
 
-    print("\nOptional (press Enter to skip):\n")
+    renderer.info("Optional (press Enter to skip):")
     api_key = await _read_line("  api_key") or ""
     temp_str = await _read_line("  temperature") or "0.0"
     thinking = await _read_line("  thinking (enabled/disabled)", "disabled") or "disabled"
@@ -121,9 +111,9 @@ async def _run_create(store: ModelStore) -> None:
 
     try:
         store.add(profile, set_active=True)
-        print(f"\nModel '{name}' created and activated.\n")
+        renderer.success(f"Model '{name}' created and activated.")
     except ValueError as e:
-        print(f"\nError: {e}\n")
+        renderer.error(f"Error: {e}")
 
 
 # -------------------------------------------------------------------------- #
@@ -144,8 +134,8 @@ async def handle(raw: str, agent: QueryAgent | None = None) -> bool:
     sub = parts[1].lower()
 
     if sub not in VALID_SUBS:
-        print(f"Unknown sub-command: '{sub}'")
-        print(f"Valid sub-commands: {', '.join(VALID_SUBS)}\n")
+        get_renderer().error(f"Unknown sub-command: '{sub}'")
+        get_renderer().info(f"Valid sub-commands: {', '.join(VALID_SUBS)}")
         return False
 
     store = get_store()
@@ -156,19 +146,18 @@ async def handle(raw: str, agent: QueryAgent | None = None) -> bool:
 
     if sub == "switch":
         if len(parts) < 3:
-            print("Usage: /model switch <name>\n")
+            get_renderer().error("Usage: /model switch <name>")
             return False
         name = parts[2]
         try:
             store.switch(name)
             profile = store.get(name)
-            print(f"Switched to model '{name}'.")
+            get_renderer().success(f"Switched to model '{name}'.")
             if profile:
-                _print_profile(name, profile, is_active=True, name_width=len(name))
-            print()
+                get_renderer().render_models([(profile.name, getattr(profile, "model", "?"), True)])
         except ValueError as e:
-            print(f"Error: {e}")
-            print("Use /model list to see available models.\n")
+            get_renderer().error(f"Error: {e}")
+            get_renderer().info("Use /model list to see available models.")
         return False
 
     return False

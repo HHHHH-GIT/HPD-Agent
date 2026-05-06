@@ -3,6 +3,7 @@
 import concurrent.futures
 
 from src.agents import QueryAgent
+from src.cli import get_renderer
 from src.commands.handlers.tokens import _count_context_tokens, _count_tokens
 from src.llm import get_llm
 from src.memory.context import ConversationContext, MessageRole
@@ -65,12 +66,13 @@ def _summarize_sync(ctx: ConversationContext) -> str:
 
 def run(raw: str, agent: QueryAgent) -> bool:
     """Handle /summary command."""
+    renderer = get_renderer()
     ctx = agent._get_context()
     old_msg_tokens = _count_context_tokens(ctx)
     old_sub_task_tokens = _count_sub_task_tokens(ctx)
     old_total = old_msg_tokens + old_sub_task_tokens
 
-    print("正在生成摘要...")
+    renderer.info("正在生成摘要...")
     toolchain = _executor.submit(_build_toolchain, ctx).result()
     summary_text = _executor.submit(_summarize_sync, ctx).result()
 
@@ -97,14 +99,13 @@ def run(raw: str, agent: QueryAgent) -> bool:
     saved_total = old_total - new_msg_tokens
     saved_msg = old_msg_tokens - new_msg_tokens
 
-    print(f"\n=== 摘要已生成 ===")
-    print(f"\n{full_content}")
-    print(f"\n────────────────────")
-    msg_saved_pct = (saved_msg / old_msg_tokens * 100) if old_msg_tokens else 0
-    sub_saved_pct = (old_sub_task_tokens / old_total * 100) if old_total else 0
-    print(f"  Conversation history:  {old_msg_tokens:>6} -> {new_msg_tokens:>6}  (节省 ~{saved_msg}, {msg_saved_pct:.1f}%)")
-    if old_sub_task_tokens > 0:
-        print(f"  Sub-task results:     {old_sub_task_tokens:>6} -> {0:>6}  (节省 ~{old_sub_task_tokens}, {sub_saved_pct:.1f}%)")
-    print(f"  Total:               {old_total:>6} -> {new_msg_tokens:>6}  (节省 ~{saved_total})")
+    renderer.render_summary(
+        summary_text=full_content,
+        old_msg_tokens=old_msg_tokens,
+        new_msg_tokens=new_msg_tokens,
+        old_sub_task_tokens=old_sub_task_tokens,
+        old_total=old_total,
+        saved_total=saved_total,
+    )
 
     return False
