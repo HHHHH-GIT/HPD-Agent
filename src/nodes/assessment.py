@@ -13,17 +13,24 @@ async def first_level_assessment(state: AgentState) -> AgentState:
     """
     tracer = get_tracer()
     with tracer.span("first_level_assessment") as span_id:
-        # Build history section (same pattern as direct_answer)
-        history = state.get("conversation_history")
-        history_text = history.to_summary() if history else ""
-        history_section = f"【对话历史】\n{history_text}\n\n" if history_text else ""
+        if state.get("force_complex"):
+            print("[Assessment] 检测到末尾 &, 本轮请求强制进入复杂任务路由")
+            result = AssessmentResult(
+                difficulty=TaskDifficulty.COMPLEX,
+                reasoning="User forced complex routing via trailing '&'.",
+            )
+        else:
+            # Build history section (same pattern as direct_answer)
+            history = state.get("conversation_history")
+            history_text = history.to_summary() if history else ""
+            history_section = f"【对话历史】\n{history_text}\n\n" if history_text else ""
 
-        prompt = ASSESSMENT_PROMPT.format(
-            history_section=history_section,
-            query=state["input"],
-        )
+            prompt = ASSESSMENT_PROMPT.format(
+                history_section=history_section,
+                query=state["input"],
+            )
 
-        result = await _classify_with_retry(prompt)
+            result = await _classify_with_retry(prompt)
 
         tin, tout, model = TokenTrackerCallback.snapshot()
         tracer.record_tokens(span_id, tokens_in=tin, tokens_out=tout, model=model)
@@ -32,6 +39,7 @@ async def first_level_assessment(state: AgentState) -> AgentState:
         node="first_level_assessment",
         result={
             "difficulty": result.difficulty.value,
+            "forced": bool(state.get("force_complex")),
         },
     )
 

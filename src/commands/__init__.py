@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable
 
 from src.agents import QueryAgent
 from src.commands.handlers import (
+    run_budget,
     run_context,
     run_exit,
     run_help,
@@ -23,6 +24,7 @@ from src.commands.handlers import (
     run_love,
     run_lsp,
     run_model,
+    run_riskless,
     run_sessions,
     run_skim,
     run_summary,
@@ -42,6 +44,7 @@ __all__ = [
 CommandHandler = Callable[[str, QueryAgent], bool | Awaitable[bool]]
 
 COMMAND_HANDLERS: dict[str, CommandHandler] = {
+    "/budget":    run_budget,
     "/context":    run_context,
     "/exit":       run_exit,
     "/help":       run_help,
@@ -49,6 +52,7 @@ COMMAND_HANDLERS: dict[str, CommandHandler] = {
     "/I!Love'You!": run_love,
     "/lsp":       run_lsp,
     "/model":      run_model,
+    "/riskless":   run_riskless,
     "/sessions":   run_sessions,
     "/skim":       run_skim,
     "/summary":    run_summary,

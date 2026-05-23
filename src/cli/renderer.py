@@ -151,6 +151,7 @@ class CliRenderer:
         tool_schema_tokens: int,
         sub_task_tokens: int,
         tool_tokens: int,
+        preview_breakdown: dict[str, int] | None = None,
     ) -> None:
         table = Table(box=box.SIMPLE_HEAVY, header_style="accent")
         table.add_column("Category", style="accent")
@@ -164,6 +165,9 @@ class CliRenderer:
         table.add_row("Analysis cache", str(sub_task_tokens), "saved for /summary, not resident context")
         if tool_tokens > 0:
             table.add_row("Tool summaries", str(tool_tokens), "already included in resident context")
+        if preview_breakdown:
+            for label, value in preview_breakdown.items():
+                table.add_row(label, str(value), "preview-only estimate")
         body = Text()
         body.append(f"Context window: {left_tokens} left / {resident_tokens} used / {max_tokens}\n", style="accent")
         body.append(self._bar(pct), style="accent")
@@ -267,6 +271,7 @@ class CliRenderer:
         tokens_in = getattr(span, "tokens_in", 0)
         tokens_out = getattr(span, "tokens_out", 0)
         model = getattr(span, "model", "")
+        token_source = getattr(span, "token_source", "missing")
 
         text = Text()
         text.append(f"{status_icon} ", style=status_style)
@@ -274,6 +279,7 @@ class CliRenderer:
         text.append(f"  {duration_ms / 1000:.2f}s", style="accent")
         if tokens_in or tokens_out:
             text.append(f"  in {tokens_in} / out {tokens_out}", style="muted")
+            text.append(f"  {token_source}", style="muted")
         if model:
             text.append(f"  {model}", style="muted")
         return text

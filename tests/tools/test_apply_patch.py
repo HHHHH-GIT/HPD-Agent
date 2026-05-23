@@ -2679,6 +2679,16 @@ class TestToolListIntegration:
             "read_file",
             "apply_patch",
             "terminal",
+            "websearch",
+            "browser_open",
+            "browser_click",
+            "browser_fill",
+            "browser_extract",
+            "browser_scroll",
+            "browser_screenshot",
+            "browser_wait",
+            "crawl_site",
+            "web_task",
             "code_search",
             "code_outline",
             "code_context",
@@ -2704,13 +2714,23 @@ class TestToolListIntegration:
             "read_file",
             "apply_patch",
             "terminal",
+            "websearch",
+            "browser_open",
+            "browser_click",
+            "browser_fill",
+            "browser_extract",
+            "browser_scroll",
+            "browser_screenshot",
+            "browser_wait",
+            "crawl_site",
+            "web_task",
             "code_search",
             "code_outline",
             "code_context",
             "code_semantic",
             "code_verify",
         ]
-        assert "safe_prefixes" in client_source
+        assert "should_confirm_terminal_command" in client_source
         assert "terminal" in client_source
         assert write_file.name == "write_file"
 

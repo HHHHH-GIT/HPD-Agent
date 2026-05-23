@@ -17,6 +17,9 @@ class AgentState(TypedDict):
     input: str
     """User's original question."""
 
+    force_complex: bool
+    """Whether the user explicitly forced complex-task routing for this query."""
+
     analysis: TaskDifficulty | None
     """First-level assessment result (simple | complex). Set by first_level_assessment node."""
 

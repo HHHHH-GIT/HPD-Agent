@@ -54,6 +54,16 @@ Level-1 Assessment (simple / complex)
 | `read_file(path, lines=100)` | Read file contents with optional line limit                                           |
 | `apply_patch(...)`           | The only supported write path for repository edits; includes dry-run and conflict hints |
 | `terminal(cmd)`              | Execute shell commands; terminal commands require confirmation in the CLI             |
+| `websearch(query, max_results=5)` | Search the web and return concise result summaries without fetching page bodies |
+| `browser_open(url, ...)`     | Open a page in a managed Playwright browser worker                                   |
+| `browser_click(selector, ...)` | Click an element; high-risk targets require explicit confirmation                   |
+| `browser_fill(selector, value, ...)` | Fill an input; sensitive targets require explicit confirmation                  |
+| `browser_extract(...)`       | Extract visible text, links, and tables from the current page                         |
+| `browser_scroll(...)`        | Scroll the current page                                                              |
+| `browser_screenshot(...)`    | Save a screenshot and return the artifact path                                       |
+| `browser_wait(...)`          | Wait for a selector or timeout                                                       |
+| `crawl_site(start_url, ...)` | Crawl same-domain pages and return concise page summaries                            |
+| `web_task(task, start_url, ...)` | High-level browser-backed research helper over a start URL                       |
 
 ### Routing Levels
 
@@ -94,6 +104,8 @@ All commands are entered at the REPL prompt.
 | `/skim [path]`          | Scan the project and generate `HPD.MD` knowledge summary      |
 | `/summary`              | Summarize context and reset the context window (saves tokens) |
 | `/tokens`               | Show context-window occupancy and next-request estimates      |
+| `/budget [normal\|extended\|web]` | Set tool-loop rounds/calls; context gate remains enabled |
+| `/riskless [on\|off]`   | Toggle confirmation prompts for normal terminal commands; extreme commands still ask |
 | `/trace [on\|half\|off]`| Toggle tracing: on (console+file), half (console only), off. Persisted across restarts. |
 
 ---
@@ -102,6 +114,7 @@ All commands are entered at the REPL prompt.
 
 ```bash
 pip install -e .
+playwright install chromium
 ```
 
 Or run directly without installation:
@@ -178,6 +191,7 @@ HPD-Agent tracks token usage in real-time. Use these commands to manage your con
 - `/tokens` — View resident context usage, remaining window, and rough next-call estimates
 - `/summary` — Compress conversation history to save tokens
 - `/context` — Inspect and prune the context window
+- `/budget web` — Allow longer tool loops for browser/search/crawl work while still enforcing per-request context limits
 
 `/tokens` is intentionally focused on the resident context that will be injected on the next turn, which is the closest analogue to Codex/Claude Code style “context window used”. It also shows tool-schema overhead and analysis cache separately so the headline number is not inflated by non-resident data.
 

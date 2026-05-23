@@ -1,4 +1,5 @@
 COMMAND_DETAILS = {
+    "/budget": "Set tool-loop budget: /budget [normal|extended|web]",
     "/context": "View conversation context: /context [-c COUNT] [-d]",
     "/exit": "Exit the agent",
     "/help": "Show help for available commands",
@@ -22,6 +23,7 @@ COMMAND_DETAILS = {
         "  /model create             — create a new profile",
         "  /model switch <name>     — switch to a profile",
     ]),
+    "/riskless": "Toggle terminal confirmations: /riskless [on|off]",
     "/sessions": "\n".join([
         "Manage sessions:",
         "  /sessions list             — list sessions for current project",

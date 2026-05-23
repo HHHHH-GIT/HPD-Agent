@@ -31,7 +31,7 @@ def _build_direct_prompt(state: AgentState) -> str:
 
 
 async def direct_answer(state: AgentState) -> AgentState:
-    """Handle simple tasks using the shared tool-calling path."""
+    """Handle simple tasks using the shared streaming tool-calling path."""
     renderer = get_renderer()
     renderer.blank()
     tracer = get_tracer()
@@ -39,9 +39,12 @@ async def direct_answer(state: AgentState) -> AgentState:
 
     with tracer.span("direct_answer", parent_id=parent_id) as span_id:
         prompt = _build_direct_prompt(state)
-        content, tool_results = await invoke_with_tools(prompt, tools=tool_list)
-        if content:
-            renderer.stream_answer(content)
+        content, tool_results = await invoke_with_tools(
+            prompt,
+            tools=tool_list,
+            stream=True,
+            on_token=renderer.stream_answer,
+        )
 
         tin, tout, model = TokenTrackerCallback.snapshot()
         tracer.record_tokens(span_id, tokens_in=tin, tokens_out=tout, model=model)

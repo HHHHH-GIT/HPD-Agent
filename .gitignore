@@ -66,8 +66,12 @@ env/
 
 # Cursor
 .codex/
+.codex
 /test_scheduler_context.py
 .analysis/
 HPD.MD
 CLAUDE.md
 .sisyphus/
+
+skills/
+项目面试*

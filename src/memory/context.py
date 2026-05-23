@@ -36,6 +36,17 @@ class Message(BaseModel):
     )
 
 
+class ContextArtifact(BaseModel):
+    """A non-resident context artifact stored on disk."""
+
+    artifact_id: str = Field(description="Stable artifact id within a session.")
+    kind: str = Field(description="Artifact category, such as history or sub_task.")
+    title: str = Field(description="Short human-readable title.")
+    content_ref: str = Field(description="Path relative to the artifact store root.")
+    token_count: int = Field(default=0, description="Estimated token count.")
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
 class ConversationContext(BaseModel):
     """Short-term contextual memory — rolling window of the current conversation.
 
@@ -62,6 +73,26 @@ class ConversationContext(BaseModel):
     """Accumulated sub-task outputs — tracked separately from messages because the
     synthesizer reads them from state (not from conversation_history), but they still
     consume the LLM context window when synthesizing the final answer."""
+
+    session_summary: str = Field(
+        default="",
+        description="Long-lived structured summary kept resident after compaction.",
+    )
+
+    toolchain_summary: str = Field(
+        default="",
+        description="Compact resident summary of prior tool calls and validations.",
+    )
+
+    artifacts: list[ContextArtifact] = Field(
+        default_factory=list,
+        description="References to non-resident context artifacts stored on disk.",
+    )
+
+    artifact_total_tokens: int = Field(
+        default=0,
+        description="Estimated tokens stored in non-resident artifacts.",
+    )
 
     def add_user_message(self, content: str) -> None:
         """Append a user message and trim to max_turns."""
@@ -108,9 +139,21 @@ class ConversationContext(BaseModel):
         falling back to full internal content.  Tool summaries are included as a
         separate block so important file/resource operations are not lost.
         """
-        if not self.messages:
+        if not self.messages and not self.session_summary and not self.toolchain_summary and not self.artifacts:
             return ""
         lines = []
+        if self.session_summary:
+            lines.append(f"[session_summary]\n{self.session_summary}")
+        if self.toolchain_summary:
+            lines.append(f"[toolchain_summary]\n{self.toolchain_summary}")
+        for artifact in self.artifacts:
+            lines.append(
+                "artifact: "
+                f"{artifact.artifact_id} "
+                f"kind={artifact.kind} "
+                f"tokens={artifact.token_count} "
+                f"ref={artifact.content_ref}"
+            )
         for msg in self.messages:
             prefix = "用户" if msg.role == MessageRole.USER else "助手"
             text = msg.answer_content if msg.answer_content else msg.content

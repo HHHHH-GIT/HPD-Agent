@@ -19,6 +19,16 @@ def test_code_intel_tools_registered_without_removing_existing_tools() -> None:
         "read_file",
         "apply_patch",
         "terminal",
+        "websearch",
+        "browser_open",
+        "browser_click",
+        "browser_fill",
+        "browser_extract",
+        "browser_scroll",
+        "browser_screenshot",
+        "browser_wait",
+        "crawl_site",
+        "web_task",
         "code_search",
         "code_outline",
         "code_context",
@@ -34,3 +44,7 @@ def test_code_intel_tools_are_exported_from_src_tools() -> None:
     assert tools_module.code_context.name == "code_context"
     assert tools_module.code_semantic.name == "code_semantic"
     assert tools_module.code_verify.name == "code_verify"
+    assert tools_module.websearch.name == "websearch"
+    assert tools_module.browser_open.name == "browser_open"
+    assert tools_module.crawl_site.name == "crawl_site"
+    assert tools_module.web_task.name == "web_task"

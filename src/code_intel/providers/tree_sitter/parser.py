@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import ClassVar, cast
 
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
-from tree_sitter_language_pack import get_language, get_parser
+from tree_sitter_language_pack import get_language
 
 from src.code_intel.core import ProviderUnavailable, Range, Symbol, SymbolKind
 from src.code_intel.core.languages import SUPPORTED_CODE_LANGUAGES, language_for_path
@@ -40,7 +40,15 @@ _PARENT_KIND_ALLOWLIST = {
 LanguageLoader = Callable[[str], object]
 ParserLoader = Callable[[str], object]
 _DEFAULT_LANGUAGE_LOADER = cast(LanguageLoader, get_language)
-_DEFAULT_PARSER_LOADER = cast(ParserLoader, get_parser)
+
+
+def _default_parser_loader(language: str) -> Parser:
+    parser = Parser()
+    parser.language = cast(Language, get_language(language))
+    return parser
+
+
+_DEFAULT_PARSER_LOADER = cast(ParserLoader, _default_parser_loader)
 
 
 class TreeSitterGrammarUnavailable(ProviderUnavailable):
@@ -63,8 +71,8 @@ class _SymbolDraft:
 
     @property
     def sort_key(self) -> tuple[int, int, int, int, str, str]:
-        start = _point_tuple(self.node.start_point)
-        end = _point_tuple(self.node.end_point)
+        start = _point_tuple(_node_position(self.node, "start_position"))
+        end = _point_tuple(_node_position(self.node, "end_position"))
         return (start[0], start[1], end[0], end[1], self.kind.value, self.name)
 
 
@@ -101,7 +109,8 @@ class TreeSitterParser:
         file_hash = hashlib.sha256(raw_content).hexdigest()[:16]
         parser = self._load_parser(resolved_language)
         tree = parser.parse(raw_content)
-        root = tree.root_node
+        root_node = tree.root_node
+        root = root_node() if callable(root_node) else root_node
         module_record = self._module_record(
             root, relative_path, resolved_language, file_hash
         )
@@ -212,7 +221,12 @@ class TreeSitterParser:
             for capture_name, kind in _CAPTURE_KINDS.items():
                 for node in captures.get(capture_name, []):
                     name = self._name_for_node(kind, node, name_node, raw_content)
-                    key = (kind.value, node.start_byte, node.end_byte, name)
+                    key = (
+                        kind.value,
+                        _node_byte(node, "start_byte"),
+                        _node_byte(node, "end_byte"),
+                        name,
+                    )
                     if key in seen:
                         continue
                     seen.add(key)
@@ -243,7 +257,7 @@ class TreeSitterParser:
     ) -> str:
         if name_node is not None and self._node_contains(node, name_node):
             return _node_text(name_node, raw_content)
-        field_name = node.child_by_field_name("name")
+        field_name = _node_child_by_field_name(node, "name")
         if field_name is not None:
             return _node_text(field_name, raw_content)
         if kind == SymbolKind.IMPORT:
@@ -265,13 +279,13 @@ class TreeSitterParser:
         return text.rstrip(";")
 
     def _first_descendant_name(self, node: Node, raw_content: bytes) -> str | None:
-        stack = list(node.named_children)
+        stack = _named_children(node)
         while stack:
             current = stack.pop(0)
-            field_name = current.child_by_field_name("name")
+            field_name = _node_child_by_field_name(current, "name")
             if field_name is not None:
                 return _node_text(field_name, raw_content)
-            stack.extend(current.named_children)
+            stack.extend(_named_children(current))
         return None
 
     def _kind_for_draft(self, draft: _SymbolDraft) -> SymbolKind:
@@ -283,18 +297,18 @@ class TreeSitterParser:
 
     @staticmethod
     def _is_python_or_javascript_method(node: Node) -> bool:
-        current = node.parent
+        current = _node_parent(node)
         found_function_parent = False
         while current is not None:
-            if current.type in {
+            if _node_kind(current) in {
                 "function_definition",
                 "function_declaration",
                 "method_definition",
             }:
                 found_function_parent = True
-            if current.type in {"class_definition", "class_declaration"}:
+            if _node_kind(current) in {"class_definition", "class_declaration"}:
                 return not found_function_parent
-            current = current.parent
+            current = _node_parent(current)
         return False
 
     def _module_record(
@@ -335,7 +349,9 @@ class TreeSitterParser:
         return min(
             candidates,
             key=lambda record: (
-                record.node.end_byte - record.node.start_byte if record.node else 0
+                _node_byte(record.node, "end_byte") - _node_byte(record.node, "start_byte")
+                if record.node
+                else 0
             ),
         )
 
@@ -350,11 +366,13 @@ class TreeSitterParser:
     def _node_contains(outer: Node, inner: Node | None) -> bool:
         if inner is None:
             return False
-        return outer.start_byte <= inner.start_byte and inner.end_byte <= outer.end_byte
+        return _node_byte(outer, "start_byte") <= _node_byte(inner, "start_byte") and _node_byte(
+            inner, "end_byte"
+        ) <= _node_byte(outer, "end_byte")
 
     @staticmethod
     def _signature_for_node(node: Node, raw_content: bytes) -> str | None:
-        if node.type in {"module", "program"}:
+        if _node_kind(node) in {"module", "program"}:
             return None
         return _first_statement_line(node, raw_content)
 
@@ -369,15 +387,15 @@ def _point_tuple(point: object) -> tuple[int, int]:
 
 
 def _range_for_node(node: Node) -> Range:
-    start_line, start_col = _point_tuple(node.start_point)
-    end_line, end_col = _point_tuple(node.end_point)
+    start_line, start_col = _point_tuple(_node_position(node, "start_position"))
+    end_line, end_col = _point_tuple(_node_position(node, "end_position"))
     return Range(
         start_line=start_line, start_col=start_col, end_line=end_line, end_col=end_col
     )
 
 
 def _node_text(node: Node, raw_content: bytes) -> str:
-    return raw_content[node.start_byte : node.end_byte].decode(
+    return raw_content[_node_byte(node, "start_byte") : _node_byte(node, "end_byte")].decode(
         "utf-8", errors="replace"
     )
 
@@ -385,8 +403,57 @@ def _node_text(node: Node, raw_content: bytes) -> str:
 def _first_statement_line(node: Node, raw_content: bytes) -> str:
     text = _node_text(node, raw_content).strip()
     if not text:
-        return node.type
+        return _node_kind(node)
     return text.splitlines()[0].strip()
+
+
+def _node_value(node: Node, name: str) -> object:
+    attr = getattr(node, name)
+    return attr() if callable(attr) else attr
+
+
+def _node_kind(node: Node) -> str:
+    attr_name = "kind" if hasattr(node, "kind") else "type"
+    kind = _node_value(node, attr_name)
+    return str(kind)
+
+
+def _node_byte(node: Node, name: str) -> int:
+    value = _node_value(node, name)
+    return int(value)
+
+
+def _node_position(node: Node, name: str) -> object:
+    attr_name = name
+    if not hasattr(node, attr_name):
+        attr_name = "start_point" if name == "start_position" else "end_point"
+    return _node_value(node, attr_name)
+
+
+def _node_parent(node: Node) -> Node | None:
+    parent = _node_value(node, "parent")
+    return cast(Node | None, parent)
+
+
+def _node_child_by_field_name(node: Node, field_name: str) -> Node | None:
+    getter = getattr(node, "child_by_field_name")
+    child = getter(field_name) if callable(getter) else None
+    return cast(Node | None, child)
+
+
+def _named_children(node: Node) -> list[Node]:
+    existing = getattr(node, "named_children", None)
+    if existing is not None:
+        return list(cast(Sequence[Node], existing))
+
+    children: list[Node] = []
+    count_value = getattr(node, "named_child_count")
+    count = int(count_value() if callable(count_value) else count_value)
+    child_getter = getattr(node, "named_child")
+    for index in range(count):
+        child = child_getter(index) if callable(child_getter) else None
+        children.append(cast(Node, child))
+    return children
 
 
 __all__ = [

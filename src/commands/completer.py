@@ -154,6 +154,30 @@ class CommandCompleter(Completer):
                         yield Completion(s, start_position=-len(sub))
             return
 
+        # ── /riskless sub-commands ────────────────────────────────
+        if cmd == "/riskless":
+            riskless_subs = ("on", "off")
+            if len(parts) == 1:
+                for s in riskless_subs:
+                    yield Completion(s, start_position=0)
+            elif len(parts) == 2:
+                for s in riskless_subs:
+                    if s.startswith(sub):
+                        yield Completion(s, start_position=-len(sub))
+            return
+
+        # ── /budget sub-commands ─────────────────────────────────
+        if cmd == "/budget":
+            budget_subs = ("normal", "extended", "web")
+            if len(parts) == 1:
+                for s in budget_subs:
+                    yield Completion(s, start_position=0)
+            elif len(parts) == 2:
+                for s in budget_subs:
+                    if s.startswith(sub):
+                        yield Completion(s, start_position=-len(sub))
+            return
+
         # ── Generic top-level command completion ────────────────────
         for c in command_names:
             if c.startswith(text) and c != cmd:

@@ -14,7 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from src.memory.context import ConversationContext, Message
+from src.memory.context import ContextArtifact, ConversationContext, Message
 
 
 def _project_hash(cwd: str | None = None) -> str:
@@ -52,6 +52,10 @@ def save(ctx: ConversationContext, session_id: str, project_hash: str | None = N
         "project_hash": ph,
         "messages": [m.model_dump(mode="json") for m in ctx.messages],
         "sub_task_outputs": ctx.sub_task_outputs,
+        "session_summary": ctx.session_summary,
+        "toolchain_summary": ctx.toolchain_summary,
+        "artifacts": [a.model_dump(mode="json") for a in ctx.artifacts],
+        "artifact_total_tokens": ctx.artifact_total_tokens,
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
     }
@@ -77,6 +81,13 @@ def load(session_id: str, project_hash: str | None = None) -> ConversationContex
     ctx = ConversationContext(
         messages=msgs,
         sub_task_outputs=raw.get("sub_task_outputs", []),
+        session_summary=raw.get("session_summary", ""),
+        toolchain_summary=raw.get("toolchain_summary", ""),
+        artifacts=[
+            ContextArtifact.model_validate(a)
+            for a in raw.get("artifacts", [])
+        ],
+        artifact_total_tokens=raw.get("artifact_total_tokens", 0),
     )
     return ctx
 

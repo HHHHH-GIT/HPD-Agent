@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 from collections.abc import Sequence
 from typing import Any, TYPE_CHECKING, cast
@@ -6,6 +7,13 @@ from typing import Any, TYPE_CHECKING, cast
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from src.core.state import AgentState
+from src.memory.budget import build_prompt_preview, should_compact
+from src.memory.compaction import (
+    CompactionConfig,
+    compact_context,
+    default_artifact_store,
+    summarize_compaction_with_llm,
+)
 from src.memory import ConversationContext, MessageRole, get_checkpointer
 from src.memory.session_store import (
     _project_hash,
@@ -19,6 +27,27 @@ from src.workflow import build_graph
 
 if TYPE_CHECKING:
     from src.code_intel.runtime import CodeIntelRuntime
+
+
+def parse_query_control_flags(raw_query: str) -> tuple[str, bool]:
+    """Parse user-level control suffixes from a raw query string.
+
+    Current controls:
+      - trailing ``&`` forces the query into the complex DAG route
+      - trailing ``\\&`` keeps a literal ampersand with no force flag
+    """
+    stripped = raw_query.rstrip()
+    if not stripped:
+        return raw_query, False
+    if stripped.endswith("\\&"):
+        return stripped[:-2] + "&", False
+    if not stripped.endswith("&"):
+        return raw_query, False
+
+    content = stripped[:-1].rstrip()
+    if not content:
+        return raw_query, False
+    return content, True
 
 
 class QueryAgent:
@@ -37,8 +66,89 @@ class QueryAgent:
         self._session_boot_done: set[str] = set()
         self._auto_save_enabled: bool = True
         self._project_hash: str = _project_hash()
+        self._project_dir: str = os.getcwd()
         self.code_intel_runtime: "CodeIntelRuntime | None" = None
         self._load_all()
+
+    def _count_context_tokens(self, text: str) -> int:
+        """Best-effort token counter for request gating and compaction."""
+        try:
+            import tiktoken
+
+            return len(tiktoken.get_encoding("cl100k_base").encode(text))
+        except Exception:
+            return max(1, len(text) // 4) if text else 0
+
+    def _model_context_window(self) -> int:
+        """Read context window from active model profile if configured."""
+        try:
+            from src.models import get_store
+
+            profile = get_store().active_profile()
+            extra_body = getattr(profile, "extra_body", {}) if profile else {}
+            if isinstance(extra_body, dict):
+                for key in ("context_window", "max_context_tokens", "max_input_tokens"):
+                    value = extra_body.get(key)
+                    if value:
+                        return int(value)
+        except Exception:
+            pass
+        return 128_000
+
+    def _count_tool_schema_tokens(self) -> int:
+        """Best-effort tool schema token count used by prompt preview."""
+        try:
+            import json
+
+            from langchain_core.utils.function_calling import convert_to_openai_function
+
+            from src.tools import tool_list
+
+            return sum(
+                self._count_context_tokens(
+                    json.dumps(convert_to_openai_function(tool), ensure_ascii=False)
+                )
+                for tool in tool_list
+            )
+        except Exception:
+            return 0
+
+    def maybe_compact_context(
+        self,
+        query: str,
+        *,
+        thread_id: str | None = None,
+        force_complex: bool = False,
+    ) -> bool:
+        """Compact resident context before sending an oversized next request."""
+        sid = thread_id or self._current_session
+        ctx = self._get_context(sid)
+        max_tokens = self._model_context_window()
+        config = CompactionConfig(max_tokens=max_tokens)
+        preview = build_prompt_preview(
+            ctx,
+            query=query,
+            force_complex=force_complex,
+            token_counter=self._count_context_tokens,
+            max_tokens=max_tokens,
+            tool_schema_tokens=self._count_tool_schema_tokens(),
+            include_boot_prompt=sid not in self._session_boot_done,
+        )
+        if not should_compact(preview, precompact_ratio=config.precompact_ratio):
+            return False
+        result = compact_context(
+            ctx,
+            session_id=sid,
+            project_hash=self._project_hash,
+            artifact_store=default_artifact_store(self._project_hash),
+            token_counter=self._count_context_tokens,
+            config=config,
+            force=preview.usage_ratio >= config.force_ratio,
+            summarizer=summarize_compaction_with_llm,
+        )
+        if result.compacted and self._auto_save_enabled:
+            save_session(ctx, sid, self._project_hash)
+        return result.compacted
 
     def _load_all(self) -> None:
         """Restore all persisted sessions for the current project from disk."""
@@ -168,17 +278,33 @@ output
 
         return ", ".join(parts) if parts else ""
 
-    async def ainvoke(self, query: str, thread_id: str | None = None) -> AgentState:
+    async def ainvoke(
+        self,
+        query: str,
+        thread_id: str | None = None,
+        force_complex: bool | None = None,
+    ) -> AgentState:
         """Run the graph and return the final state.
 
         For simple tasks: final_response is populated — caller prints it.
         For complex tasks: synthesis_prompt is populated — caller must stream
         a synthesizer LLM call using that prompt.
         """
+        normalized_query, suffix_forced_complex = parse_query_control_flags(query)
+        if force_complex is None:
+            force_complex = suffix_forced_complex
+        else:
+            force_complex = force_complex or suffix_forced_complex
+
         sid = thread_id or self._current_session
         ctx = self._get_context(sid)
         self._backfill_missing_tool_summary(ctx)
-        ctx.add_user_message(query)
+        self.maybe_compact_context(
+            normalized_query,
+            thread_id=sid,
+            force_complex=force_complex,
+        )
+        ctx.add_user_message(normalized_query)
 
         if sid not in self._session_boot_done:
             self._session_boot_done.add(sid)
@@ -190,7 +316,8 @@ output
             )
 
         initial_state: AgentState = {
-            "input": query,
+            "input": normalized_query,
+            "force_complex": force_complex,
             "analysis": None,
             "tasks": [],
             "decomposition_result": None,

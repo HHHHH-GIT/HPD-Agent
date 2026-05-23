@@ -8,10 +8,12 @@ structured-output and streaming via astream_events) contributes tokens to
 the global TokenTrackerCallback accumulator.
 """
 
+import json
 import os
+from collections.abc import Callable
 from typing import Any, cast
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 from langchain_openai.chat_models.base import BaseChatOpenAI
@@ -19,7 +21,15 @@ from pydantic import BaseModel
 
 from src.cli import get_renderer
 from src.core.observability import TokenTrackerCallback
+from src.core.riskless import is_riskless_enabled
+from src.llm.tool_context import (
+    ToolContextPolicy,
+    ToolLoopContextManager,
+    count_tokens,
+)
+from src.memory.compaction import SessionArtifactStore
 from src.tools.invocation import invoke_tool
+from src.tools.terminal_policy import should_confirm_terminal_command
 
 # ----------------------------------------------------------------------
 # Token-tracker (global singleton, populated by monkey-patches below)
@@ -44,7 +54,7 @@ def _install_token_tracker() -> None:
                 model = (
                     getattr(self, "model_name", "") or getattr(self, "model", "") or ""
                 )
-                _token_callback._accumulate(tin, tout, model)
+                _token_callback._accumulate(tin, tout, model, source="api")
         return result
 
     ChatOpenAI._agenerate = tracked_agenerate
@@ -68,7 +78,7 @@ def _install_token_tracker() -> None:
                 model = (
                     getattr(self, "model_name", "") or getattr(self, "model", "") or ""
                 )
-                _token_callback._accumulate(tin, tout, model)
+                _token_callback._accumulate(tin, tout, model, source="api")
         return result
 
     BaseChatOpenAI._convert_chunk_to_generation_chunk = tracked_convert
@@ -210,10 +220,118 @@ def get_llm_with_tools(
     stream: bool = False,
 ) -> ChatOpenAI:
     """Build a ChatOpenAI client and bind tools to it."""
-    llm = get_llm(model=model, temperature=temperature, base_url=base_url)
+    llm = get_llm(
+        model=model,
+        temperature=temperature,
+        base_url=base_url,
+        stream=stream,
+    )
     if tools:
         llm = cast(ChatOpenAI, llm.bind_tools(tools))
     return llm
+
+
+async def _stream_llm_response(
+    llm: Any,
+    messages: list,
+    on_token: Callable[[str], None] | None = None,
+) -> AIMessage:
+    """Stream a chat response and return the merged message for tool handling."""
+    merged = None
+    content_parts: list[str] = []
+
+    async for chunk in llm.astream(messages):
+        if merged is None:
+            merged = chunk
+        else:
+            try:
+                merged = merged + chunk
+            except TypeError:
+                merged = chunk
+
+        token = getattr(chunk, "content", "") or ""
+        if isinstance(token, str) and token:
+            content_parts.append(token)
+            if on_token:
+                on_token(token)
+
+    if merged is None:
+        return AIMessage(content="")
+
+    content = getattr(merged, "content", "") or "".join(content_parts)
+    tool_calls = getattr(merged, "tool_calls", []) or []
+    return AIMessage(content=content, tool_calls=tool_calls)
+
+
+async def _invoke_llm_response(
+    llm: Any,
+    messages: list,
+    stream: bool = False,
+    on_token: Callable[[str], None] | None = None,
+) -> AIMessage:
+    """Invoke the model, optionally streaming text chunks to the caller."""
+    if stream:
+        return await _stream_llm_response(llm, messages, on_token=on_token)
+    return cast(AIMessage, await llm.ainvoke(messages))
+
+
+def _active_span_token_snapshot() -> tuple[str, int, int]:
+    """Return the active span id and current token counters for fallback estimation."""
+    from src.core.observability import get_tracer
+
+    tracer = get_tracer()
+    span_id = tracer._active_span_id.get() or ""
+    span = tracer.get_span(span_id) if span_id else None
+    if span is None:
+        return "", 0, 0
+    return span_id, span.tokens_in, span.tokens_out
+
+
+def _estimate_llm_usage(messages: list, response: Any, llm: Any) -> tuple[int, int]:
+    """Estimate LLM usage when the provider does not return usage metadata."""
+    prompt_text = "\n".join(
+        str(getattr(message, "content", "") or "") for message in messages
+    )
+    response_text = str(getattr(response, "content", "") or "")
+    tool_calls = getattr(response, "tool_calls", []) or []
+    if tool_calls:
+        response_text = f"{response_text}\n{json.dumps(tool_calls, ensure_ascii=False, default=str)}"
+    input_tokens = count_tokens(prompt_text)
+    output_tokens = count_tokens(response_text)
+    return input_tokens, output_tokens
+
+
+def _record_estimated_usage_if_missing(
+    *,
+    llm: Any,
+    messages: list,
+    response: Any,
+    before: tuple[str, int, int],
+) -> None:
+    """Fallback to estimated usage when the active span did not receive API usage."""
+    span_id, before_in, before_out = before
+    if not span_id:
+        return
+
+    from src.core.observability import get_tracer
+
+    tracer = get_tracer()
+    span = tracer.get_span(span_id)
+    if span is None:
+        return
+    if span.tokens_in != before_in or span.tokens_out != before_out:
+        return
+
+    input_tokens, output_tokens = _estimate_llm_usage(messages, response, llm)
+    if input_tokens or output_tokens:
+        model = getattr(llm, "model_name", "") or getattr(llm, "model", "") or ""
+        tracer.record_tokens(
+            span_id,
+            tokens_in=input_tokens,
+            tokens_out=output_tokens,
+            model=model,
+            token_source="estimated",
+        )
 
 
 async def _finalize_with_available_context(
@@ -222,6 +340,8 @@ async def _finalize_with_available_context(
     model: str | None = None,
     temperature: float | None = None,
     base_url: str | None = None,
+    stream: bool = False,
+    on_token: Callable[[str], None] | None = None,
 ) -> str:
     """Produce a best-effort final answer after tool budget exhaustion.
 
@@ -229,7 +349,12 @@ async def _finalize_with_available_context(
     one last no-tool model call so the current task can still conclude with a
     reasoned answer instead of returning only partial tool traces.
     """
-    llm = get_llm(model=model, temperature=temperature, base_url=base_url)
+    llm = get_llm(
+        model=model,
+        temperature=temperature,
+        base_url=base_url,
+        stream=stream,
+    )
     finalize_prompt = (
         "工具调用预算已经耗尽，不能再调用任何工具。\n"
         f"原因：{reason}\n\n"
@@ -237,7 +362,20 @@ async def _finalize_with_available_context(
         "如果信息不完整或无法完全确认，请明确指出哪些部分仍未验证。"
         "不要再请求工具，也不要假装已获取未出现的信息。"
     )
-    response = await llm.ainvoke([*messages, HumanMessage(content=finalize_prompt)])
+    final_messages = [*messages, HumanMessage(content=finalize_prompt)]
+    before_tokens = _active_span_token_snapshot()
+    response = await _invoke_llm_response(
+        llm,
+        final_messages,
+        stream=stream,
+        on_token=on_token,
+    )
+    _record_estimated_usage_if_missing(
+        llm=llm,
+        messages=final_messages,
+        response=response,
+        before=before_tokens,
+    )
     return getattr(response, "content", "") or ""
 
 
@@ -248,9 +386,13 @@ async def invoke_with_tools(
     temperature: float | None = None,
     base_url: str | None = None,
     stream: bool = False,
-    max_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
-    max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
+    max_rounds: int | None = None,
+    max_tool_calls: int | None = None,
     on_budget_exceeded: str = "finalize",
+    on_token: Callable[[str], None] | None = None,
+    context_window: int | None = None,
+    tool_context_policy: ToolContextPolicy | None = None,
+    artifact_store: SessionArtifactStore | None = None,
 ) -> tuple[str, str]:
     """Invoke the LLM with tool-calling support.
 
@@ -258,7 +400,7 @@ async def invoke_with_tools(
         prompt: The user prompt to send.
         tools: List of tools available to the LLM.
         model / temperature / base_url: Override active profile settings.
-        stream: If True, yields chunks via print; returns full content.
+        stream: If True, streams text chunks through on_token; returns full content.
 
     Returns:
         (final_text, tool_calls_log) — the LLM's final text response and a
@@ -276,19 +418,46 @@ async def invoke_with_tools(
     messages: list[Any] = [HumanMessage(content=prompt)]
     tool_results: list[str] = []
     full_content = ""
-    active_model = ""
+    effective_max_rounds = DEFAULT_MAX_TOOL_ROUNDS if max_rounds is None else max_rounds
+    effective_max_tool_calls = (
+        DEFAULT_MAX_TOOL_CALLS if max_tool_calls is None else max_tool_calls
+    )
+    effective_tool_context_policy: ToolContextPolicy = tool_context_policy or "auto"
+    if max_rounds is None or max_tool_calls is None or tool_context_policy is None:
+        try:
+            from src.core.tool_budget import get_tool_budget_profile
+
+            budget = get_tool_budget_profile()
+            if max_rounds is None:
+                effective_max_rounds = budget.max_rounds
+            if max_tool_calls is None:
+                effective_max_tool_calls = budget.max_tool_calls
+            if tool_context_policy is None:
+                effective_tool_context_policy = budget.tool_context_policy
+        except Exception:
+            pass
+    tool_context = ToolLoopContextManager(
+        context_window=context_window or _model_context_window(),
+        policy=effective_tool_context_policy,
+        artifact_store=artifact_store,
+        token_counter=count_tokens,
+    )
 
     tool_call_count = 0
-    for _ in range(max_rounds):
-        response = await llm.ainvoke(messages)
-
-        usage = getattr(response, "usage_metadata", None) or {}
-        if usage:
-            input_tokens = usage.get("input_tokens", 0)
-            output_tokens = usage.get("output_tokens", 0)
-            if input_tokens or output_tokens:
-                active_model = getattr(llm, "model_name", "")
-                _token_callback._accumulate(input_tokens, output_tokens, active_model)
+    for _ in range(effective_max_rounds):
+        before_tokens = _active_span_token_snapshot()
+        response = await _invoke_llm_response(
+            llm,
+            messages,
+            stream=stream,
+            on_token=on_token,
+        )
+        _record_estimated_usage_if_missing(
+            llm=llm,
+            messages=messages,
+            response=response,
+            before=before_tokens,
+        )
 
         content = getattr(response, "content", "") or ""
         tool_calls = getattr(response, "tool_calls", []) or []
@@ -297,10 +466,10 @@ async def invoke_with_tools(
             full_content = content
             break
 
-        if tool_call_count + len(tool_calls) > max_tool_calls:
+        if tool_call_count + len(tool_calls) > effective_max_tool_calls:
             reason = (
                 f"Tool budget exceeded: {tool_call_count + len(tool_calls)} calls "
-                f"would exceed limit {max_tool_calls}."
+                f"would exceed limit {effective_max_tool_calls}."
             )
             if on_budget_exceeded == "raise":
                 raise RuntimeError(reason)
@@ -311,6 +480,8 @@ async def invoke_with_tools(
                 model=model,
                 temperature=temperature,
                 base_url=base_url,
+                stream=stream,
+                on_token=on_token,
             )
             break
 
@@ -341,31 +512,18 @@ async def invoke_with_tools(
                 if name == "terminal":
                     cmd = args.get("cmd", "")
                     print(f"[DEBUG] Tool '{name}' → terminal command: {cmd}")
-                    safe_prefixes = (
-                        "pwd",
-                        "ls",
-                        "cat",
-                        "echo",
-                        "date",
-                        "whoami",
-                        "head",
-                        "tail",
-                        "less",
-                        "file ",
-                        "stat ",
-                        "uname",
-                        "id",
-                        "hostname",
-                        "env",
-                        "printenv",
+                    decision = should_confirm_terminal_command(
+                        str(cmd),
+                        riskless_enabled=is_riskless_enabled(),
+                        project_dir=os.getcwd(),
                     )
-                    if cmd.strip().startswith(safe_prefixes) or cmd.strip().startswith(
-                        "cd "
-                    ):
+                    if not decision.requires_confirmation:
                         result = await invoke_tool(tool, args)
                         success = not str(result).startswith("[Error]")
                     else:
-                        confirm = get_renderer().confirm(f"Allow terminal command? {cmd}")
+                        confirm = get_renderer().confirm(
+                            f"Allow terminal command? {cmd} ({decision.reason})"
+                        )
                         if not confirm:
                             result = "[Cancelled] User declined to execute the terminal command"
                             print(f"[DEBUG] Tool '{name}' cancelled by user")
@@ -384,15 +542,41 @@ async def invoke_with_tools(
                     else:
                         print(f"[DEBUG] Tool '{name}' failed:\n{str(result)[:4000]}")
 
-            messages.append(AIMessage(content="", tool_calls=[call]))
-            messages.append(
-                ToolMessage(name=name, content=str(result), tool_call_id=call_id)
+            ok, context_reason = tool_context.append_tool_interaction(
+                messages,
+                call=call,
+                name=name,
+                args=dict(args),
+                result=result,
             )
             args_str = ", ".join(f"{k}={v!r}" for k, v in args.items()) if args else ""
-            tool_results.append(f"[Tool: {name}({args_str})]\n{result}")
+            tool_results.append(
+                f"[Tool: {name}({args_str})]\n{messages[-1].content if messages else result}"
+            )
+            _record_tool_context_metadata(tool_context)
+            if not ok:
+                reason = f"[ToolContextExhausted] {context_reason}"
+                tool_results.append(reason)
+                if on_budget_exceeded == "raise":
+                    raise RuntimeError(reason)
+                tool_context.prepare_final_messages(messages, reason)
+                full_content = await _finalize_with_available_context(
+                    messages,
+                    reason=reason,
+                    model=model,
+                    temperature=temperature,
+                    base_url=base_url,
+                    stream=stream,
+                    on_token=on_token,
+                )
+                _record_tool_context_metadata(tool_context)
+                return full_content, "\n\n".join(tool_results)
 
     else:
-        reason = f"Tool interaction exceeded max rounds ({max_rounds}) without final response."
+        reason = (
+            f"Tool interaction exceeded max rounds ({effective_max_rounds}) "
+            "without final response."
+        )
         if on_budget_exceeded == "raise":
             raise RuntimeError(reason)
         print(f"[DEBUG] {reason}")
@@ -402,6 +586,42 @@ async def invoke_with_tools(
             model=model,
             temperature=temperature,
             base_url=base_url,
+            stream=stream,
+            on_token=on_token,
         )
 
+    _record_tool_context_metadata(tool_context)
     return full_content, "\n\n".join(tool_results)
+
+
+def _model_context_window() -> int:
+    """Return active model context window, defaulting to 128k."""
+    try:
+        profile = _active_profile()
+        extra_body = getattr(profile, "extra_body", {}) if profile else {}
+        if isinstance(extra_body, dict):
+            for key in ("context_window", "max_context_tokens", "max_input_tokens"):
+                value = extra_body.get(key)
+                if value:
+                    return int(value)
+    except Exception:
+        pass
+    return 128_000
+
+
+def _record_tool_context_metadata(manager: ToolLoopContextManager) -> None:
+    from src.core.observability import get_tracer
+
+    tracer = get_tracer()
+    span_id = tracer._active_span_id.get()
+    span = tracer.get_span(span_id or "")
+    if span is None:
+        return
+    span.metadata.update(
+        {
+            "tool_context_tokens": manager.stats.tool_context_tokens,
+            "tool_artifact_tokens": manager.stats.tool_artifact_tokens,
+            "tool_messages_compacted": manager.stats.tool_messages_compacted,
+            "tool_context_exhausted": manager.stats.tool_context_exhausted,
+        }
+    )

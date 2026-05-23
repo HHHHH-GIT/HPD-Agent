@@ -13,6 +13,7 @@ import os
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +52,7 @@ class TraceSpan:
     tokens_in:     int = 0
     tokens_out:    int = 0
     model:     str = ""
+    token_source: str = "missing"
     metadata:  dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -69,6 +71,7 @@ class TraceSpan:
             "error_msg": self.error_msg,
             "tokens":   {"in": self.tokens_in, "out": self.tokens_out},
             "model":    self.model,
+            "token_source": self.token_source,
             "metadata": self.metadata,
         }
 
@@ -91,11 +94,11 @@ class TraceRecord:
 
     @property
     def total_tokens_in(self) -> int:
-        return sum(s.tokens_in for s in self.spans)
+        return sum(s.tokens_in for s in self.spans if s.token_source != "missing")
 
     @property
     def total_tokens_out(self) -> int:
-        return sum(s.tokens_out for s in self.spans)
+        return sum(s.tokens_out for s in self.spans if s.token_source != "missing")
 
     def estimate_cost(self) -> float:
         total = 0.0
@@ -161,6 +164,7 @@ class Tracer:
     """Manages the active trace and its spans."""
 
     _local = threading.local()
+    _active_span_id: ContextVar[str | None] = ContextVar("active_trace_span_id", default=None)
 
     def __init__(self) -> None:
         self._record: TraceRecord | None = None
@@ -239,6 +243,15 @@ class Tracer:
                         s.error_msg  = error_msg
                     break
 
+    def get_span(self, span_id: str) -> TraceSpan | None:
+        if self._record is None:
+            return None
+        with self._lock:
+            for span in self._record.spans:
+                if span.span_id == span_id:
+                    return span
+        return None
+
     # ── Convenience context-manager ─────────────────────────────────────
 
     def span(
@@ -262,6 +275,7 @@ class Tracer:
         tokens_in: int,
         tokens_out: int,
         model: str = "",
+        token_source: str = "api",
     ) -> None:
         """Add or update token counts on a span."""
         if self._record is None or not span_id:
@@ -269,17 +283,19 @@ class Tracer:
         with self._lock:
             for s in self._record.spans:
                 if s.span_id == span_id:
-                    s.tokens_in  = tokens_in
-                    s.tokens_out = tokens_out
+                    if tokens_in or tokens_out:
+                        s.tokens_in  += tokens_in
+                        s.tokens_out += tokens_out
                     if model:
                         s.model = model
+                    s.token_source = _merge_token_source(s.token_source, token_source)
                     break
 
 
 class _SpanContext:
     """Returned by Tracer.span() so callers can use it with `with`."""
 
-    __slots__ = ("_tracer", "_name", "_parent_id", "_model", "_metadata", "_span_id")
+    __slots__ = ("_tracer", "_name", "_parent_id", "_model", "_metadata", "_span_id", "_token")
 
     def __init__(
         self,
@@ -295,11 +311,13 @@ class _SpanContext:
         self._model    = model
         self._metadata = metadata
         self._span_id  = ""
+        self._token    = None
 
     def __enter__(self) -> str:
         self._span_id = self._tracer.start_span(
             self._name, self._parent_id, self._model, self._metadata,
         )
+        self._token = self._tracer._active_span_id.set(self._span_id)
         return self._span_id
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -315,6 +333,8 @@ class _SpanContext:
             status=status,
             error_msg=error_msg,
         )
+        if hasattr(self, "_token"):
+            self._tracer._active_span_id.reset(self._token)
 
 
 # ----------------------------------------------------------------------
@@ -327,30 +347,77 @@ class TokenTrackerCallback(BaseCallbackHandler):
     Each span calls snapshot() to pop its own token delta.
     """
 
-    _accumulated: dict = {}
+    _accumulated: dict[str, dict[str, Any]] = {}
     _lock = threading.Lock()
 
     @classmethod
-    def _accumulate(cls, tokens_in: int, tokens_out: int, model: str) -> None:
+    def _accumulate(
+        cls,
+        tokens_in: int,
+        tokens_out: int,
+        model: str,
+        source: str = "api",
+    ) -> None:
         """Called by the monkey-patch to record tokens (thread-safe)."""
+        tracer = get_tracer()
+        span_id = tracer._active_span_id.get()
         with cls._lock:
-            cls._accumulated.setdefault("", {"in": 0, "out": 0, "model": ""})
-            cls._accumulated[""]["in"]  += tokens_in
+            if span_id:
+                entry = cls._accumulated.setdefault(
+                    span_id,
+                    {"in": 0, "out": 0, "model": "", "source": "missing"},
+                )
+                entry["in"] += tokens_in
+                entry["out"] += tokens_out
+                if model:
+                    entry["model"] = model
+                entry["source"] = _merge_token_source(entry["source"], source)
+                record = tracer.get_span(span_id)
+                if record is not None:
+                    record.tokens_in += tokens_in
+                    record.tokens_out += tokens_out
+                    if model:
+                        record.model = model
+                    record.token_source = _merge_token_source(record.token_source, source)
+                return
+
+            cls._accumulated.setdefault(
+                "",
+                {"in": 0, "out": 0, "model": "", "source": "missing"},
+            )
+            cls._accumulated[""]["in"] += tokens_in
             cls._accumulated[""]["out"] += tokens_out
-            if model and not cls._accumulated[""]["model"]:
+            if model:
                 cls._accumulated[""]["model"] = model
+            cls._accumulated[""]["source"] = _merge_token_source(
+                cls._accumulated[""]["source"],
+                source,
+            )
 
     @classmethod
     def snapshot(cls) -> tuple[int, int, str]:
         """Pop and return accumulated tokens, resetting state."""
         with cls._lock:
-            entry = cls._accumulated.pop("", {"in": 0, "out": 0, "model": ""})
+            span_id = get_tracer()._active_span_id.get()
+            if span_id:
+                cls._accumulated.pop(span_id, None)
+                return 0, 0, ""
+            key = span_id or ""
+            entry = cls._accumulated.pop(key, {"in": 0, "out": 0, "model": "", "source": "missing"})
         return entry["in"], entry["out"], entry["model"]
 
     @classmethod
     def reset(cls) -> None:
         with cls._lock:
             cls._accumulated.clear()
+
+
+def _merge_token_source(current: str, incoming: str) -> str:
+    """Merge token source quality without downgrading api usage."""
+    priority = {"missing": 0, "estimated": 1, "api": 2}
+    current = current or "missing"
+    incoming = incoming or "missing"
+    return incoming if priority.get(incoming, 0) > priority.get(current, 0) else current
 
 
 # ----------------------------------------------------------------------

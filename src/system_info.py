@@ -19,6 +19,7 @@ def _run(cmd: str, default: str = "") -> str:
 def collect() -> str:
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     cwd = os.getcwd()
+    proj_root = _find_project_root(cwd) or cwd
     lines = [
         f"## 系统环境 [{now}]",
     ]
@@ -27,6 +28,7 @@ def collect() -> str:
     py_version = platform.python_version()
     lines.append(f"- OS: {uname}")
     lines.append(f"- Python: {py_version}")
+    lines.append(f"- 当前项目目录: {proj_root}")
     lines.append(f"- 工作目录: {cwd}")
 
     git_branch = _run("git rev-parse --abbrev-ref HEAD")
@@ -54,7 +56,6 @@ def collect() -> str:
     else:
         lines.append("  无未提交变更")
 
-    proj_root = _find_project_root(cwd)
     if proj_root and proj_root != cwd:
         lines.append(f"- 项目根目录: {proj_root}")
         pyproject = Path(proj_root) / "pyproject.toml"
